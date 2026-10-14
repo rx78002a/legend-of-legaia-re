@@ -1324,6 +1324,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "legaia-boss-swap"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "legaia-actor-formats",
+ "legaia-disc-patch",
+ "legaia-iso",
+ "legaia-party-swap",
+ "png",
+]
+
+[[package]]
 name = "legaia-bytes"
 version = "0.1.0"
 

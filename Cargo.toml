@@ -33,6 +33,7 @@ members = [
     "crates/arts-patch",
     "crates/delilas-party",
     "crates/delilas-challenge",
+    "crates/boss-swap",
     "crates/patcher",
     "crates/mdec",
     "crates/art",
@@ -160,6 +161,7 @@ legaia-disc-patch = { path = "crates/disc-patch" }
 legaia-translate = { path = "crates/translate" }
 legaia-code-hooks = { path = "crates/code-hooks" }
 legaia-party-swap = { path = "crates/party-swap" }
+legaia-boss-swap = { path = "crates/boss-swap" }
 legaia-arts-patch = { path = "crates/arts-patch" }
 legaia-delilas-party = { path = "crates/delilas-party" }
 legaia-delilas-challenge = { path = "crates/delilas-challenge" }

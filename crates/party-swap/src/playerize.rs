@@ -31,6 +31,7 @@ use super::*;
 use legaia_actor_formats::battle_char_assembly::record0_texture_uploads;
 use legaia_actor_formats::battle_data_pack::decode_record;
 
+pub mod boss;
 mod frame_bake;
 mod hands;
 mod rebuild;

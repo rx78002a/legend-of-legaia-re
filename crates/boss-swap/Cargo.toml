@@ -1,0 +1,21 @@
+[package]
+name = "legaia-boss-swap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "legaia_boss_swap"
+path = "src/lib.rs"
+
+[[bin]]
+name = "boss-swap"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+legaia-actor-formats.workspace = true
+legaia-disc-patch.workspace = true
+legaia-iso.workspace = true
+legaia-party-swap.workspace = true
+png.workspace = true
