@@ -207,9 +207,38 @@ fn cort_first_form_routes_guilty_cross() {
         &[0x37, 0, 0, 0],
         "routed, no pooled pose"
     );
+    // Mystic Circle rides Hyper Elbow with its one pose in the pool
+    assert_eq!(scus[off(l.table) + 0x29 - 0x10], 0xB7);
+    assert_eq!(scus[at + 4], 0xB7, "slot 1 routes Mystic Circle");
+    let pooled = u16::from_le_bytes(scus[at + 6..at + 8].try_into().unwrap()) as usize;
+    assert!(pooled != 0, "Mystic Circle has a pooled pose");
+    let m938 = p.read_entry(938).unwrap();
+    let edits = module_cast::edits_938();
+    for e in &edits {
+        assert_eq!(word(&m938, e.va), e.replace, "938 {:#x}", e.va);
+    }
+    let ws: Vec<u32> = m938
+        .chunks(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for e in &edits {
+        let i = ((e.va - 0x801F_69D8) / 4) as usize;
+        let lo = i.saturating_sub(1);
+        let hi = (i + 3).min(ws.len());
+        for h in legaia_boss_swap::hazard::load_hazards(&ws[lo..hi]) {
+            let at = lo + h;
+            assert!(
+                !(at == i || at + 1 == i),
+                "load-delay hazard at {:#x}",
+                0x801F_69D8 + at as u32 * 4
+            );
+        }
+    }
     let r0 = Record0::parse(&p.read_entry_footprint(863).unwrap()).unwrap();
     let (parts, frames) = r0.stream_shape(0x0A).expect("row A");
     assert!(parts > 0 && frames > 0, "row 0xa authored");
+    assert!(pooled < r0.clut_a, "pool entry below the load-time scratch");
+    assert!(r0.decoded[pooled + 0xAC] > 0 && r0.decoded[pooled + 0xAD] > 0);
 }
 
 /// Cort's left face half lives in the companion TIM (slot id + 8): the build
@@ -237,4 +266,31 @@ fn cort_face_comes_from_the_companion_page() {
         "{:?}",
         report.notes
     );
+}
+
+/// Probe: write the patched cast modules of a Cort build to `PROBE_DIR`
+/// (`cargo test -p legaia-boss-swap --test module_cast_real dump_patched -- --ignored`).
+#[test]
+#[ignore]
+fn dump_patched_modules() {
+    let Some(image) = disc() else { return };
+    let Some(dir) = std::env::var_os("PROBE_DIR") else {
+        return;
+    };
+    let mut p = DiscPatcher::open(image).expect("open disc");
+    apply(
+        &mut p,
+        &Options {
+            monster: 180,
+            ..Options::default()
+        },
+    )
+    .expect("apply boss swap");
+    for n in [938usize, 940, 944, 966] {
+        std::fs::write(
+            std::path::Path::new(&dir).join(format!("p{n:04}.bin")),
+            p.read_entry(n).unwrap(),
+        )
+        .unwrap();
+    }
 }

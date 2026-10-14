@@ -88,16 +88,23 @@ pub struct Report {
 
 /// Clip lengths above which a clip is decimated (half the frames, half the
 /// rate) when the rebuilt player file does not fit; `None` keeps every pose.
-/// The second field also decimates the stage poses.
-const DECIMATE_CAPS: [(Option<usize>, bool); 8] = [
-    (None, false),
-    (Some(40), false),
-    (Some(30), false),
-    (Some(22), false),
-    (Some(16), false),
-    (Some(12), false),
-    (Some(22), true),
-    (Some(16), true),
+/// The second and third fields are the factors the stage rows and the pooled
+/// stage poses are decimated by.
+const DECIMATE_CAPS: [(Option<usize>, usize, usize); 14] = [
+    (None, 1, 1),
+    (Some(40), 1, 1),
+    (Some(30), 1, 1),
+    (Some(22), 1, 1),
+    (Some(16), 1, 1),
+    (Some(12), 1, 1),
+    (Some(22), 1, 2),
+    (Some(16), 1, 2),
+    (Some(12), 1, 2),
+    (Some(12), 1, 3),
+    (Some(22), 2, 2),
+    (Some(16), 2, 2),
+    (Some(12), 2, 2),
+    (Some(12), 3, 3),
 ];
 
 /// Apply the boss swap to Vahn's slot. Writes through `patcher`.
@@ -107,13 +114,17 @@ const DECIMATE_CAPS: [(Option<usize>, bool); 8] = [
 /// size checks, so a retry starts from the untouched image.
 pub fn apply(patcher: &mut DiscPatcher, opts: &Options) -> Result<Report> {
     let mut last = None;
-    for (cap, stage) in DECIMATE_CAPS {
-        match apply_with(patcher, opts, cap, stage) {
+    for (cap, stage, pool) in DECIMATE_CAPS {
+        match apply_with(patcher, opts, cap, stage, pool) {
             Ok(mut report) => {
                 if let Some(cap) = cap {
                     report.notes.push(format!(
                         "record[0] clips longer than {cap} frames decimated (half the poses, half the rate){}",
-                        if stage { ", stage poses too" } else { "" }
+                        if stage > 1 || pool > 1 {
+                            format!(", stage rows at 1/{stage}, pooled stage poses at 1/{pool}")
+                        } else {
+                            String::new()
+                        }
                     ));
                 }
                 return Ok(report);
@@ -127,7 +138,7 @@ pub fn apply(patcher: &mut DiscPatcher, opts: &Options) -> Result<Report> {
                     return Err(e);
                 }
                 if std::env::var_os("BOSS_DEBUG").is_some() {
-                    eprintln!("cap {cap:?} stage {stage}: {text}");
+                    eprintln!("cap {cap:?} stage 1/{stage} pool 1/{pool}: {text}");
                 }
                 last = Some(e);
             }
@@ -140,7 +151,8 @@ fn apply_with(
     patcher: &mut DiscPatcher,
     opts: &Options,
     decimate_over: Option<usize>,
-    decimate_stage: bool,
+    decimate_stage: usize,
+    decimate_pool: usize,
 ) -> Result<Report> {
     let mut report = Report::default();
     let archive = patcher
@@ -228,6 +240,8 @@ fn apply_with(
     plan.fireball_swing = swing_fireball;
     plan.decimate_over = decimate_over;
     plan.decimate_stage = decimate_stage;
+    plan.decimate_pool = decimate_pool;
+    plan.decimate_filler = decimate_pool > 1;
     let mut pool_spells: Vec<u8> = Vec::new();
     if !module_specials.is_empty() {
         // The modules stage the caster by raw monster action index; those
@@ -242,26 +256,30 @@ fn apply_with(
         let mut first: Option<usize> = None;
         let mut second_clips = Vec::new();
         for s in &module_specials {
-            let (one, two) = module_cast::stage_entries(s.spell)
+            let entries = module_cast::stage_entries(s.spell)
                 .with_context(|| format!("no stage entries for spell {:#04x}", s.spell))?;
-            let clip = by_entry(one);
-            match first {
-                None => first = Some(clip),
-                Some(f) if f != clip => bail!(
-                    "spell {:#04x} stages a different first pose than the others:                      row A holds one pose per build",
-                    s.spell
-                ),
-                _ => {}
+            if let Some(one) = entries.row_a {
+                let clip = by_entry(one);
+                match first {
+                    None => first = Some(clip),
+                    Some(f) if f != clip => bail!(
+                        "spell {:#04x} stages a different first pose than the others:                          row A holds one pose per build",
+                        s.spell
+                    ),
+                    _ => {}
+                }
             }
-            if let Some(two) = two {
+            if let Some(two) = entries.pooled {
                 pool_spells.push(s.spell);
                 second_clips.push(by_entry(two));
             }
         }
-        let a = first.context("no cast-module specials")?;
         // Row 6 keeps its retail stub: the prep helper repoints its table word
         // on every routed cast, so no pose of its own is stored.
-        plan.stage_rows = vec![(usize::from(module_cast::STAGE_ROW_A), a)];
+        plan.stage_rows = first
+            .map(|a| (usize::from(module_cast::STAGE_ROW_A), a))
+            .into_iter()
+            .collect();
         plan.stage_pool = second_clips;
     }
     if opts.fireball_swing && opts.direct_cast && opts.up_melee {
@@ -408,6 +426,16 @@ fn map_idle(plan: &boss::BossPlan) -> usize {
     plan.map.idle
 }
 
+/// Module spells a model plays that its own record does not list: Cort's first
+/// form (#180) carries the cast clips of all his spells, and only Guilty Cross
+/// is in its record (the other forms list the rest).
+fn borrowed_spells(monster: u16) -> &'static [u8] {
+    match monster {
+        180 => &[module_cast::SPELL_MYSTIC_CIRCLE],
+        _ => &[],
+    }
+}
+
 /// The arts routed into cast modules for this boss, or none when its specials
 /// are not module spells. A boss spell id is live when `> 1` (monster record
 /// `+0x21..=0x23`); a module spell is a capture-class record (`'c'`) this
@@ -427,14 +455,17 @@ fn module_route(
         let off = legaia_game_tables::item_names::file_offset_for_va(&scus, va)?;
         scus.get(off).copied()
     };
-    let spells: Vec<u8> = block
+    let mut spells: Vec<u8> = block
         .get(0x21..0x24)
         .unwrap_or(&[])
         .iter()
         .copied()
+        .chain(borrowed_spells(opts.monster).iter().copied())
         .filter(|&s| s > 1 && class_of(s) == Some(b'c'))
         .filter(|&s| module_cast::module_for(s).is_some())
         .collect();
+    spells.sort_unstable();
+    spells.dedup();
     if spells.is_empty() {
         return Ok(Vec::new());
     }
@@ -447,9 +478,7 @@ fn module_route(
     }
     // Defaults: the boss's spells, lowest id first, onto Somersault and
     // Hyper Elbow.
-    let mut sorted = spells;
-    sorted.sort_unstable();
-    Ok(sorted
+    Ok(spells
         .into_iter()
         .zip([0x27u8, 0x29])
         .map(|(spell, constant)| module_cast::Special { constant, spell })

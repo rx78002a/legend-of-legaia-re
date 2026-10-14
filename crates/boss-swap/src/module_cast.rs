@@ -83,6 +83,8 @@ pub const SPELL_HYPER_CRUSH: u8 = 0x4B;
 pub const SPELL_HYPER_LIGHTNING: u8 = 0x4C;
 /// Cort's Guilty Cross (PROT 944).
 pub const SPELL_GUILTY_CROSS: u8 = 0x37;
+/// Cort's Mystic Circle (PROT 938, tick body `0x801F69EC`).
+pub const SPELL_MYSTIC_CIRCLE: u8 = 0xB7;
 /// The row table holds up to `ROW_SLOTS` routed spells, four bytes each:
 /// `[spell, 0, pool entry offset (u16)]`, an empty slot has spell `0`.
 pub const ROW_SLOTS: usize = 4;
@@ -96,17 +98,30 @@ pub struct Special {
     pub spell: u8,
 }
 
-/// The caster stage entries a module asks for, as monster action indices:
-/// `(first, second)`. The player file authors the first on row
-/// [`STAGE_ROW_A`] and the second (when the module stages one) into the pool
-/// the prep helper picks from.
-pub fn stage_entries(spell: u8) -> Option<(usize, Option<usize>)> {
-    match spell {
-        SPELL_HYPER_CRUSH => Some((0x0D, Some(0x0B))),
-        SPELL_HYPER_LIGHTNING => Some((0x0D, Some(0x0C))),
-        SPELL_GUILTY_CROSS => Some((0x08, None)),
-        _ => None,
-    }
+/// The caster stage entries a module asks for, as monster action indices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StageEntries {
+    /// The entry authored on row [`STAGE_ROW_A`], shared by every spell of a
+    /// build that stages one there.
+    pub row_a: Option<usize>,
+    /// The entry authored into the pool the cast prep helper points row
+    /// [`STAGE_ROW_B`] at, per spell.
+    pub pooled: Option<usize>,
+}
+
+/// The stage entries of a spell. Hyper Crush and Hyper Lightning stage a pose
+/// on row A and a second one on row B; Guilty Cross stages only row A; Mystic
+/// Circle stages one pose, on row B, so it can share a build with Guilty
+/// Cross (whose pose owns row A).
+pub fn stage_entries(spell: u8) -> Option<StageEntries> {
+    let (row_a, pooled) = match spell {
+        SPELL_HYPER_CRUSH => (Some(0x0D), Some(0x0B)),
+        SPELL_HYPER_LIGHTNING => (Some(0x0D), Some(0x0C)),
+        SPELL_GUILTY_CROSS => (Some(0x08), None),
+        SPELL_MYSTIC_CIRCLE => (None, Some(0x07)),
+        _ => return None,
+    };
+    Some(StageEntries { row_a, pooled })
 }
 
 /// Where everything sits: scratch and tables in ARENA2, the prep helper in
@@ -468,12 +483,64 @@ pub fn edits_944() -> Vec<ModuleEdit> {
     }]
 }
 
+/// PROT 938 (Mystic Circle, `0xB7`) edits. The body is five phases behind the
+/// head table: 0 and 1 hide the party row, 2 shows it again, 3 hits it, 4
+/// resets the caster. Every loop walks `actor_table[0 .. ctx[+0]]`; a party
+/// caster must hide, show and hit the monster row instead, so each loop takes
+/// its seat range and pointer from the sweep scratch (see 936). The caster's
+/// one stage pose is raw row 7, which becomes row `0x06` (the pooled pose).
+pub fn edits_938() -> Vec<ModuleEdit> {
+    let ctx = |reg: u32| m::lw(V0, reg, 0xBD24); // lw v0,-0x42dc(reg)
+    let load_count = 0x9042_0000; // lbu v0,0(v0)
+    let lui_v0_801d = 0x3C02_801D;
+    let table_v1 = m::addiu(V1, V0, 0x9370); // addiu v1,v0,-0x6c90
+    let end = m::lbu(V0, GP, gp_off(1));
+    let ed = |va, expect, replace| ModuleEdit {
+        va,
+        expect,
+        replace,
+    };
+    // A hide / show loop: the counter starts at the first victim seat, the
+    // pointer at its table cell, and the bound is the absolute end seat. The
+    // two loads sit two words before the first use of the pointer.
+    let sweep = |ctx_reg: u32, entry: u32, setup: u32, tail: u32| {
+        vec![
+            ed(entry, ctx(ctx_reg), end),
+            ed(entry + 8, load_count, m::nop()),
+            ed(setup, lui_v0_801d, m::lw(V1, GP, gp_off(8))),
+            ed(setup + 4, table_v1, m::lbu(S2, GP, gp_off(0))),
+            ed(tail, ctx(ctx_reg), end),
+            ed(tail + 8, load_count, m::nop()),
+        ]
+    };
+    let mut v = vec![ed(0x801F_6CC8, 0x2402_0007, stage_imm(STAGE_ROW_B))];
+    v.extend(sweep(A0, 0x801F_6BA4, 0x801F_6BBC, 0x801F_6BDC)); // phase 0 hide
+    v.extend(sweep(A0, 0x801F_6C04, 0x801F_6C20, 0x801F_6C40)); // phase 1 hide
+    v.extend(sweep(A1, 0x801F_6ED8, 0x801F_6EF8, 0x801F_6F18)); // phase 2 show
+    // phase 3 damage sweep: the counter is the victim seat
+    v.extend([
+        ed(0x801F_70A8, ctx(V1), end),
+        ed(0x801F_70B0, load_count, m::nop()),
+        ed(
+            0x801F_70BC,
+            m::addu(S2, ZERO, ZERO),
+            m::lbu(S2, GP, gp_off(0)),
+        ),
+        ed(0x801F_70C0, lui_v0_801d, m::lw(S3, GP, gp_off(8))),
+        ed(0x801F_70C4, m::addiu(S3, V0, 0x9370), m::nop()),
+        ed(0x801F_71C8, ctx(V1), end),
+        ed(0x801F_71D0, load_count, m::nop()),
+    ]);
+    v
+}
+
 /// Module PROT entry and edits for a spell.
 pub fn module_for(spell: u8) -> Option<(usize, Vec<ModuleEdit>)> {
     match spell {
         SPELL_HYPER_CRUSH => Some((936, edits_936())),
         SPELL_HYPER_LIGHTNING => Some((937, edits_937())),
         SPELL_GUILTY_CROSS => Some((944, edits_944())),
+        SPELL_MYSTIC_CIRCLE => Some((938, edits_938())),
         _ => None,
     }
 }

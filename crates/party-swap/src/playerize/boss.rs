@@ -479,10 +479,10 @@ pub fn stage_entry(
     e
 }
 
-/// A stage pose as the plan wants it embedded.
-fn stage_clip(plan: &BossPlan, clip: &BossClip) -> BossClip {
-    if plan.decimate_stage {
-        clip.decimated(2)
+/// A stage pose as the plan wants it embedded, decimated by `k` (1 = whole).
+fn stage_clip(k: usize, clip: &BossClip) -> BossClip {
+    if k > 1 {
+        clip.decimated(k)
     } else {
         clip.clone()
     }
@@ -668,9 +668,13 @@ pub struct BossPlan {
     /// half the rate) where record[0] embeds them. Swings and arts keep every
     /// pose: only record[0] has the tight budget.
     pub decimate_over: Option<usize>,
-    /// Stage poses (rows and pool entries) are decimated as well: they are
-    /// parked poses, so half the poses cost little.
-    pub decimate_stage: bool,
+    /// Factor the stage rows are decimated by (they are parked poses, so
+    /// fewer poses cost little); `1` keeps every pose.
+    pub decimate_stage: usize,
+    /// The same for the pooled stage poses.
+    pub decimate_pool: usize,
+    /// Rows 7 and 8 (idle placeholders) are decimated by two.
+    pub decimate_filler: bool,
 }
 
 fn power_hits(rec: &[u8]) -> usize {
@@ -797,7 +801,9 @@ pub fn plan_boss_with(
         stage_rows: Vec::new(),
         stage_pool: Vec::new(),
         decimate_over: None,
-        decimate_stage: false,
+        decimate_stage: 1,
+        decimate_pool: 1,
+        decimate_filler: false,
     })
 }
 
@@ -870,7 +876,7 @@ pub fn rebuild_record0(
             _ if stage.is_some() => {
                 let parts = rec0.stream_shape(0).map(|s| s.0).unwrap_or(0);
                 let (_, ci) = *stage.unwrap();
-                let clip = stage_clip(plan, &clips[ci]);
+                let clip = stage_clip(plan.decimate_stage, &clips[ci]);
                 out.extend_from_slice(&stage_entry(slot, &clip, rig, parts, scale));
             }
             Some(&ci) if populated => {
@@ -884,6 +890,9 @@ pub fn rebuild_record0(
                     {
                         clips[ci].decimated(2)
                     }
+                    // Rows 7 and 8 only hold the idle as a placeholder for
+                    // retail's chain rows: half its poses are enough.
+                    _ if plan.decimate_filler && (slot == 7 || slot == 8) => clips[ci].decimated(2),
                     _ => clips[ci].clone(),
                 };
                 let e = inline_entry(
@@ -908,7 +917,7 @@ pub fn rebuild_record0(
     for &ci in &plan.stage_pool {
         pool_offsets.push(out.len());
         let parts = rec0.stream_shape(0).map(|s| s.0).unwrap_or(0);
-        let clip = stage_clip(plan, &clips[ci]);
+        let clip = stage_clip(plan.decimate_pool, &clips[ci]);
         out.extend_from_slice(&stage_entry(UP_MELEE_SLOT, &clip, rig, parts, scale));
         while !out.len().is_multiple_of(4) {
             out.push(0);
