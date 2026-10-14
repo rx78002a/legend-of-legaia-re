@@ -4,7 +4,9 @@
 //! The kernels live in `legaia_party_swap::playerize::boss`; this crate is the
 //! disc driver on top of them.
 
+pub mod asm;
 pub mod direct_cast;
+pub mod module_cast;
 pub mod render;
 
 use anyhow::{Context, Result, bail};
@@ -44,6 +46,10 @@ pub struct Options {
     /// into record[0] row `0x0A` and a plain Up press plays it. Off, a plain
     /// Up press plays the Down swing.
     pub up_melee: bool,
+    /// `(art constant, capture-class spell)` pairs for a boss whose specials
+    /// are cast-module cinematics ([`module_cast`]). Empty picks the boss's own
+    /// spells in order onto Somersault (`0x27`) and Hyper Elbow (`0x29`).
+    pub specials: Vec<(u8, u8)>,
     /// Mute the host character's own voice banks (arts shout, fanfares,
     /// swing grunt, victory barks).
     pub mute_host_voice: bool,
@@ -66,6 +72,7 @@ impl Default for Options {
             direct_cast: true,
             cast_arts: vec!["Somersault".to_string()],
             up_melee: true,
+            specials: Vec::new(),
             mute_host_voice: true,
             calm_support: true,
             fireball_damage: true,
@@ -94,7 +101,7 @@ pub fn apply(patcher: &mut DiscPatcher, opts: &Options) -> Result<Report> {
             Ok(mut report) => {
                 if let Some(cap) = cap {
                     report.notes.push(format!(
-                        "clips longer than {cap} frames decimated (half the poses, twice the rate)"
+                        "record[0] clips longer than {cap} frames decimated (half the poses, twice the rate)"
                     ));
                 }
                 return Ok(report);
@@ -144,13 +151,6 @@ fn apply_with(
     let base_n = me_archive::parse(slot_bytes(base_slot)?)?.len();
 
     let mut clips = boss::boss_clips(&archive, opts.monster)?;
-    if let Some(cap) = decimate_over {
-        for c in &mut clips {
-            if c.len() > cap {
-                *c = c.decimated(2);
-            }
-        }
-    }
     let rec0 = boss::Record0::parse(&player)?;
     // The fireball needs a cast clip that ends in a move-power terminator. A
     // boss whose specials are cast-module cinematics has none: it plays its
@@ -167,6 +167,17 @@ fn apply_with(
         local.direct_cast = false;
     }
     let opts = &local;
+    let module_specials = module_route(patcher, &archive, opts)?;
+    if !module_specials.is_empty() {
+        report.notes.push(format!(
+            "cast-module specials: {}",
+            module_specials
+                .iter()
+                .map(|s| format!("art {:#04x} -> spell {:#04x}", s.constant, s.spell))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
     let fireball = if opts.fireball_art.is_some() {
         Some(boss::add_fireball_clip(&mut clips)?)
     } else {
@@ -193,6 +204,21 @@ fn apply_with(
     let fb = fireball.zip(opts.fireball_art.as_deref());
     let mut plan = boss::plan_boss_with(&rec0, map, main_n, base_n, fb)?;
     plan.fireball_swing = swing_fireball;
+    plan.decimate_over = decimate_over;
+    if !module_specials.is_empty() {
+        // The modules stage the caster by raw row: author two stage poses from
+        // the boss's own cast clips (the last two tag-0x23 entries).
+        let mut cast: Vec<usize> = (0..clips.len()).filter(|&i| clips[i].tag == 0x23).collect();
+        if cast.is_empty() {
+            cast.push(map_idle(&plan));
+        }
+        let a = *cast.last().unwrap();
+        let b = cast.len().checked_sub(2).map(|i| cast[i]).unwrap_or(a);
+        plan.stage_rows = vec![
+            (usize::from(module_cast::STAGE_ROW_A), a),
+            (usize::from(module_cast::STAGE_ROW_B), b),
+        ];
+    }
     if opts.fireball_swing && opts.direct_cast && opts.up_melee {
         plan.up_melee = Some(up_melee_clip);
     }
@@ -311,10 +337,78 @@ fn apply_with(
             }
         ));
     }
+    if !module_specials.is_empty() {
+        let fresh = module_cast::install(patcher, &module_specials)?;
+        report.notes.push(format!(
+            "cast-module route {}",
+            if fresh {
+                "installed"
+            } else {
+                "already in place"
+            }
+        ));
+    }
     if opts.mute_host_voice {
         mute_vahn_voice(patcher, &mut report)?;
     }
     Ok(report)
+}
+
+fn map_idle(plan: &boss::BossPlan) -> usize {
+    plan.map.idle
+}
+
+/// The arts routed into cast modules for this boss, or none when its specials
+/// are not module spells. A boss spell id is live when `> 1` (monster record
+/// `+0x21..=0x23`); a module spell is a capture-class record (`'c'`) this
+/// crate has module edits for.
+fn module_route(
+    patcher: &DiscPatcher,
+    archive: &[u8],
+    opts: &Options,
+) -> Result<Vec<module_cast::Special>> {
+    let block = legaia_actor_formats::monster_archive::decode_block(archive, opts.monster)?
+        .context("empty monster slot")?;
+    let scus = patcher
+        .read_named_file("SCUS_942.54")
+        .context("read SCUS_942.54")?;
+    let class_of = |id: u8| -> Option<u8> {
+        let va = 0x8007_54C8u32 + u32::from(id) * 12;
+        let off = legaia_game_tables::item_names::file_offset_for_va(&scus, va)?;
+        scus.get(off).copied()
+    };
+    let spells: Vec<u8> = block
+        .get(0x21..0x24)
+        .unwrap_or(&[])
+        .iter()
+        .copied()
+        .filter(|&s| s > 1 && class_of(s) == Some(b'c'))
+        .filter(|&s| {
+            matches!(
+                s,
+                module_cast::SPELL_HYPER_CRUSH | module_cast::SPELL_HYPER_LIGHTNING
+            )
+        })
+        .collect();
+    if spells.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !opts.specials.is_empty() {
+        return Ok(opts
+            .specials
+            .iter()
+            .map(|&(constant, spell)| module_cast::Special { constant, spell })
+            .collect());
+    }
+    // Defaults: the boss's spells, lowest id first, onto Somersault and
+    // Hyper Elbow.
+    let mut sorted = spells;
+    sorted.sort_unstable();
+    Ok(sorted
+        .into_iter()
+        .zip([0x27u8, 0x29])
+        .map(|(spell, constant)| module_cast::Special { constant, spell })
+        .collect())
 }
 
 /// Vahn's voice lives in CD-XA files, not in the battle file: the arts shout

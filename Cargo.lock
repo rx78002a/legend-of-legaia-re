@@ -1330,6 +1330,7 @@ dependencies = [
  "anyhow",
  "legaia-actor-formats",
  "legaia-code-hooks",
+ "legaia-delilas-party",
  "legaia-disc-patch",
  "legaia-game-tables",
  "legaia-iso",

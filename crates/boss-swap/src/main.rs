@@ -5,7 +5,7 @@ use legaia_disc_patch::ppf;
 
 fn usage() -> ! {
     eprintln!(
-        "usage: boss-swap build <disc.bin|.cue> <out.ppf> [--monster N] [--scale F] [--no-fireball] [--fireball-art NAME] [--no-direct-cast] [--no-fireball-swing] [--cast-art NAME] [--no-up-melee] [--keep-voices] [--keep-support-anims] [--free-fireball]\n       \
+        "usage: boss-swap build <disc.bin|.cue> <out.ppf> [--monster N] [--scale F] [--no-fireball] [--fireball-art NAME] [--no-direct-cast] [--no-fireball-swing] [--cast-art NAME] [--special CONST=SPELL] [--no-up-melee] [--keep-voices] [--keep-support-anims] [--free-fireball]\n       \
          (writes a PPF 3.0 patch; the disc image is never modified)"
     );
     std::process::exit(2);
@@ -60,6 +60,15 @@ fn main() -> Result<()> {
             "--no-up-melee" => {
                 opts.up_melee = false;
                 i += 1;
+            }
+            "--special" => {
+                let v = args.get(i + 1).context("--special CONST=SPELL (hex)")?;
+                let (c, s) = v.split_once('=').context("--special CONST=SPELL (hex)")?;
+                opts.specials.push((
+                    u8::from_str_radix(c.trim_start_matches("0x"), 16)?,
+                    u8::from_str_radix(s.trim_start_matches("0x"), 16)?,
+                ));
+                i += 2;
             }
             "--cast-art" => {
                 opts.cast_arts

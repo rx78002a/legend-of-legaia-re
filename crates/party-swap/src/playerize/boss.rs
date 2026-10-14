@@ -392,6 +392,34 @@ pub fn default_clip_map(clips: &[BossClip]) -> Result<ClipMap> {
 /// byte `0x0A` commits it through the party arm of the anim commit.
 pub const UP_MELEE_SLOT: usize = 0x0A;
 
+/// A record[0] row authored as a **caster stage pose** for a cast module.
+///
+/// A capture-class cast module drives the caster's body by writing a raw
+/// action index into `actor+0x1DA`; on a party caster the index resolves
+/// through the 12-word table at the head of record[0]. This is the
+/// proven-safe entry shape (`party_swap::cast_stage`): a zero head except the
+/// row id, the attach key `0x0A` at `+0x77`, the rate, and a hold window that
+/// parks the pose strictly inside the stream, so the clip's natural end never
+/// re-commits it from frame 0 while the module is still dwelling. No effect
+/// script, no hit event, no sound cue ride along; the module owns those.
+pub fn stage_entry(
+    row: usize,
+    clip: &BossClip,
+    rig: &PlayerRig,
+    parts: usize,
+    scale: f32,
+) -> Vec<u8> {
+    let n = clip.len();
+    let mut e = vec![0u8; PLAYER_HEAD];
+    e[0] = row as u8;
+    e[0x77] = UP_MELEE_SLOT as u8;
+    e[0x78] = clip.head[0x78].max(1);
+    let park = n.saturating_sub(2);
+    set_loop(&mut e, 0xFF, park, park);
+    e.extend_from_slice(&player_stream(&clip.frames, rig, parts, scale));
+    e
+}
+
 /// Frames between consecutive hits of a multi-hit art playing the fireball.
 const FIREBALL_HIT_GAP: usize = 2;
 /// `[count, start, end]` hold window the boss's own cast uses to charge.
@@ -560,6 +588,13 @@ pub struct BossPlan {
     /// Clip the host's record[0] action row [`UP_MELEE_SLOT`] plays as a
     /// melee swing (the High swing the fireball took over), when set.
     pub up_melee: Option<usize>,
+    /// `(record[0] row, clip)`: placeholder rows authored as caster stage
+    /// poses for the cast-module route (see [`stage_entry`]).
+    pub stage_rows: Vec<(usize, usize)>,
+    /// Clips longer than this many frames are decimated (half the poses,
+    /// twice the rate) where record[0] embeds them. Swings and arts keep every
+    /// pose: only record[0] has the tight budget.
+    pub decimate_over: Option<usize>,
 }
 
 fn power_hits(rec: &[u8]) -> usize {
@@ -683,6 +718,8 @@ pub fn plan_boss_with(
         fireball: fireball_clip,
         fireball_swing: None,
         up_melee: None,
+        stage_rows: Vec::new(),
+        decimate_over: None,
     })
 }
 
@@ -747,15 +784,25 @@ pub fn rebuild_record0(
             .unwrap_or(bank_off);
         new_offs[slot] = out.len();
         let populated = rec0.stream_shape(slot).is_some_and(|(p, f)| p > 0 && f > 0);
+        let stage = plan.stage_rows.iter().find(|(r, _)| *r == slot);
         match plan.map.slots.get(&slot) {
             _ if slot == UP_MELEE_SLOT && up_melee.is_some() => {
                 out.extend_from_slice(up_melee.unwrap());
             }
+            _ if stage.is_some() => {
+                let parts = rec0.stream_shape(0).map(|s| s.0).unwrap_or(0);
+                let (_, ci) = *stage.unwrap();
+                out.extend_from_slice(&stage_entry(slot, &clips[ci], rig, parts, scale));
+            }
             Some(&ci) if populated => {
                 let (parts, _) = rec0.stream_shape(slot).unwrap();
+                let clip = match plan.decimate_over {
+                    Some(cap) if clips[ci].len() > cap => clips[ci].decimated(2),
+                    _ => clips[ci].clone(),
+                };
                 let e = inline_entry(
                     &d[o..o + PLAYER_HEAD],
-                    &clips[ci],
+                    &clip,
                     rig,
                     parts,
                     scale,
