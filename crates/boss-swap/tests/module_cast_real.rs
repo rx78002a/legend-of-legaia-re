@@ -141,7 +141,7 @@ fn route_lands_on_the_patched_image() {
         })
         .collect();
     assert!(
-        !module_cast::install(&mut p, &specials, &pool).unwrap(),
+        !module_cast::install(&mut p, &specials, &pool, 0).unwrap(),
         "second install is a no-op"
     );
 }
@@ -212,6 +212,16 @@ fn cort_first_form_routes_guilty_cross() {
     assert_eq!(scus[at + 4], 0xB7, "slot 1 routes Mystic Circle");
     let pooled = u16::from_le_bytes(scus[at + 6..at + 8].try_into().unwrap()) as usize;
     assert!(pooled != 0, "Mystic Circle has a pooled pose");
+    // the turn scheduler streams Cort's readef group (3 * 18) for the special
+    assert_eq!(scus[off(l.readef)], 0x36);
+    let ov = p.read_entry(898).unwrap();
+    let hook_at = (0x801D_B0F0u32 - 0x801C_E818) as usize;
+    assert_eq!(
+        u32::from_le_bytes(ov[hook_at..hook_at + 4].try_into().unwrap()),
+        legaia_code_hooks::mips::jal(l.hook)
+    );
+    let hook = module_cast::assemble_readef_hook(&l);
+    assert_eq!(&scus[off(l.hook)..][..hook.len()], hook.as_slice());
     let m938 = p.read_entry(938).unwrap();
     let edits = module_cast::edits_938();
     for e in &edits {
@@ -239,6 +249,14 @@ fn cort_first_form_routes_guilty_cross() {
     assert!(parts > 0 && frames > 0, "row 0xa authored");
     assert!(pooled < r0.clut_a, "pool entry below the load-time scratch");
     assert!(r0.decoded[pooled + 0xAC] > 0 && r0.decoded[pooled + 0xAD] > 0);
+    // Mystic Circle holds its clip's arms-out frame 15; decimated by two the
+    // park lands on kept frame 8 (original 16), not on frame 7 (original 14,
+    // the pose before the arms open)
+    assert_eq!(
+        &r0.decoded[pooled + 0x84..pooled + 0x87],
+        &[0xFF, 8, 9],
+        "hold window"
+    );
 }
 
 /// Cort's left face half lives in the companion TIM (slot id + 8): the build

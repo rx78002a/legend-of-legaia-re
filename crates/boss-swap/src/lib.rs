@@ -406,7 +406,17 @@ fn apply_with(
             .zip(&b.pool_offsets)
             .map(|(&spell, &off)| (spell, off))
             .collect();
-        let fresh = module_cast::install(patcher, &module_specials, &pool)?;
+        // Monster specials stream their texture page with the boss's own readef
+        // group (record `+0x1C`); the host's turn would stream its own.
+        let readef_base = if module_specials.iter().any(|s| s.spell >= 0xA1) {
+            let block =
+                legaia_actor_formats::monster_archive::decode_block(&archive, opts.monster)?
+                    .context("empty monster slot")?;
+            block.get(0x1C).copied().unwrap_or(0).wrapping_mul(3)
+        } else {
+            0
+        };
+        let fresh = module_cast::install(patcher, &module_specials, &pool, readef_base)?;
         report.notes.push(format!(
             "cast-module route {}",
             if fresh {

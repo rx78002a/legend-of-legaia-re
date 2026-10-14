@@ -104,8 +104,15 @@ impl BossClip {
             }
         }
         if head[0x84] != 0 {
-            head[0x85] = scale(head[0x85]);
-            head[0x86] = scale(head[0x86]).max(head[0x85].saturating_add(1));
+            // The window parks on frame `end - 1`; only every `k`-th pose
+            // survives, so round the start and the parked frame *up* to a kept
+            // pose (rounding down parked Cort's Mystic Circle one pose before
+            // the arms-out frame the clip holds).
+            let up = |f: u8| (f as usize).div_ceil(k).min(255) as u8;
+            let start = up(head[0x85]);
+            let park = up(head[0x86].saturating_sub(1)).max(start);
+            head[0x85] = start;
+            head[0x86] = park.saturating_add(1);
         }
         // The cursor advances in proportion to the rate: with `1/k` of the
         // poses the same duration needs `1/k` of the rate. A rate of 1 cannot
