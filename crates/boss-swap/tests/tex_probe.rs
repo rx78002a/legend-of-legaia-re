@@ -87,3 +87,41 @@ fn scan_foreign() {
         }
     }
 }
+
+#[test]
+#[ignore]
+fn untextured_counts() {
+    let Some(path) = std::env::var_os("LEGAIA_DISC_BIN") else {
+        return;
+    };
+    let id: u16 = std::env::var("PROBE_ID").unwrap().parse().unwrap();
+    let p = DiscPatcher::open(std::fs::read(path).unwrap()).unwrap();
+    let archive = p.read_entry_footprint(867).unwrap();
+    let mesh = monster_archive::mesh(&archive, id).unwrap().unwrap();
+    let bytes = mesh.tmd_bytes();
+    let tmd = legaia_tmd::parse(bytes).unwrap();
+    for (oi, o) in tmd.objects.iter().enumerate() {
+        let (mut tex, mut flat) = (0, 0);
+        let mut cols = std::collections::BTreeSet::new();
+        for g in legaia_prims::iter_groups_lenient(
+            bytes,
+            o.primitives_byte_offset,
+            o.primitives_byte_size,
+        ) {
+            for p in &g.prims {
+                if p.uvs.is_empty() {
+                    flat += 1;
+                    for c in &p.colors {
+                        cols.insert(*c);
+                    }
+                } else {
+                    tex += 1;
+                }
+            }
+        }
+        println!(
+            "UNTEX obj {oi} textured {tex} flat {flat} colours {:?}",
+            cols.iter().take(4).collect::<Vec<_>>()
+        );
+    }
+}

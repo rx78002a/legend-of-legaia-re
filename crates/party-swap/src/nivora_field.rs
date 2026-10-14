@@ -556,7 +556,7 @@ fn layout_window(
         return Ok((window, Vec::new()));
     }
     used.sort_unstable();
-    let (group_of, group_colors) = merge_palettes(&used, cluts, win.clut_rows, warnings)?;
+    let (group_of, group_colors) = merge_palettes(&used, cluts, win.clut_rows, false, warnings)?;
 
     // Cluster faces by inflated-bbox overlap so shared texels pack once.
     let mut parent: Vec<usize> = (0..faces.len()).collect();

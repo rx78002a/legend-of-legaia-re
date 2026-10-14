@@ -706,6 +706,8 @@ fn playerize_scaled(
         &indices,
         src_width,
         None,
+        false,
+        &[],
         &reserved,
         fusions.weapon_section,
         texture_downscale,

@@ -1234,6 +1234,38 @@ fn drop_foreign_prims(objects: &mut [ModelObject], warnings: &mut Vec<String>) {
     ));
 }
 
+/// Canonical objects whose geometry the section records alias: the last
+/// attach bone of every section with an equipment variant shares its primitive
+/// region with the variant ([`alias_variant_onto_bone`]), so the loader's
+/// TSB relocation reaches those prims twice.
+fn aliased_canonical_objects(player_file: &[u8], rig: &PlayerRig) -> Result<Vec<usize>> {
+    let pack = battle_data_pack::parse(player_file).context("parse player battle file")?;
+    let mut channels: std::collections::BTreeSet<u8> = std::collections::BTreeSet::new();
+    for idx in 0..pack.records.len() {
+        let decoded = decode_record(player_file, &pack, idx)?;
+        let Some(frame_off) = legaia_bytes::u32_le(&decoded.bytes, 0).map(|v| v as usize) else {
+            continue;
+        };
+        let Some(&attach_count) = decoded.bytes.get(frame_off) else {
+            continue;
+        };
+        let attach_count = attach_count as usize;
+        let Ok(tmd) =
+            legaia_tmd::parse(&decoded.bytes[(frame_off + 0xC).min(decoded.bytes.len())..])
+        else {
+            continue;
+        };
+        if super::variant_object(attach_count, tmd.objects.len()).is_some() {
+            if let Some(&bone) = decoded.bytes.get(frame_off + attach_count) {
+                channels.insert(bone);
+            }
+        }
+    }
+    Ok((0..CANONICAL_PARTS)
+        .filter(|&c| channels.contains(&rig.channel_for_canonical[c]))
+        .collect())
+}
+
 pub fn boss_geometry(
     player_file: &[u8],
     rig: &PlayerRig,
@@ -1286,12 +1318,15 @@ pub fn boss_geometry(
                 (first..first + n_cols).collect::<Vec<u16>>()
             })
             .collect();
+    let aliased = aliased_canonical_objects(player_file, rig)?;
     let layout = relayout_to_band(
         &mut objects,
         &cluts,
         &indices,
         width,
         companion_src,
+        true,
+        &aliased,
         &reserved,
         None,
         downscale,

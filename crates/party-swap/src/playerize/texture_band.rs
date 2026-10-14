@@ -135,10 +135,17 @@ pub(in super::super) fn monster_pool_texels(
 type PaletteGroups = (BTreeMap<u8, usize>, Vec<Vec<u16>>);
 
 /// Union-merge the used palettes down to `budget` groups.
+///
+/// `idx0_opaque` counts a palette's index 0 as a colour when it is not
+/// `0x0000` (a monster palette may keep a real colour there: the PSX GPU
+/// makes a texel transparent by its CLUT value, not by its index). A palette
+/// with sixteen distinct colours then loses the least distinct one, since a
+/// band palette holds fifteen.
 pub(in super::super) fn merge_palettes(
     used: &[u8],
     cluts: &[[u16; 16]],
     budget: usize,
+    idx0_opaque: bool,
     warnings: &mut Vec<String>,
 ) -> Result<PaletteGroups> {
     // Start with one group per used palette (distinct colours, index 0
@@ -147,10 +154,22 @@ pub(in super::super) fn merge_palettes(
         .iter()
         .map(|&p| {
             let mut colors: Vec<u16> = Vec::new();
-            for &c in cluts[p as usize].iter().skip(1) {
+            for &c in cluts[p as usize].iter().skip(usize::from(!idx0_opaque)) {
                 if c != 0 && !colors.contains(&c) {
                     colors.push(c);
                 }
+            }
+            while colors.len() > 15 {
+                let mut best = (usize::MAX, 1usize);
+                for i in 0..colors.len() {
+                    for j in (i + 1)..colors.len() {
+                        let d = color_distance(colors[i], colors[j]);
+                        if d < best.0 {
+                            best = (d, j);
+                        }
+                    }
+                }
+                colors.remove(best.1);
             }
             (vec![p], colors)
         })
@@ -201,6 +220,19 @@ pub(in super::super) fn merge_palettes(
     Ok((group_of, colors))
 }
 
+/// Squared RGB555 distance of two colours.
+fn color_distance(a: u16, b: u16) -> usize {
+    let split = |v: u16| {
+        (
+            (v & 0x1F) as i32,
+            ((v >> 5) & 0x1F) as i32,
+            ((v >> 10) & 0x1F) as i32,
+        )
+    };
+    let ((ar, ag, ab), (br, bg, bb)) = (split(a), split(b));
+    ((ar - br).pow(2) + (ag - bg).pow(2) + (ab - bb).pow(2)) as usize
+}
+
 /// Nearest colour in `colors` to `c` (RGB555 distance).
 pub(in super::super) fn nearest_color(colors: &[u16], c: u16) -> usize {
     let split = |v: u16| {
@@ -249,6 +281,8 @@ pub(super) fn relayout_to_band(
     indices: &[u8],
     src_width: usize,
     companion: Option<(&[u8], usize)>,
+    idx0_opaque: bool,
+    page1_only: &[usize],
     reserved_cols: &[u16],
     exclude_section: Option<usize>,
     base_scale: u32,
@@ -314,6 +348,20 @@ pub(super) fn relayout_to_band(
         e.faces.push(i);
     }
     let mut clusters: Vec<Cluster> = clusters.into_values().collect();
+    // A cluster holding any face of a `page1_only` object is placed on page 1
+    // (authoring texpage `0x16`) only: the battle loader's TSB relocation maps
+    // `0x15` to the slot's first page and every other page to its second, and
+    // an object whose primitive region two object-table entries share is
+    // relocated twice - which sends a page-0 face to page 1 and leaves a
+    // page-1 face where it is.
+    let page1: Vec<bool> = clusters
+        .iter()
+        .map(|c| {
+            c.faces
+                .iter()
+                .any(|&fi| page1_only.contains(&faces[fi].obj))
+        })
+        .collect();
 
     // Multi-region shelf pack: place each cluster into one band region
     // (a face samples a single texpage, so a cluster cannot straddle a
@@ -336,6 +384,9 @@ pub(super) fn relayout_to_band(
             let w = ((c.bbox.2 - c.bbox.0) as usize + 1).div_ceil(s);
             let h = ((c.bbox.3 - c.bbox.1) as usize + 1).div_ceil(s);
             for (ri, r) in regions.iter().enumerate() {
+                if page1[i] && r.page != 1 {
+                    continue;
+                }
                 // The weapon section's tile belongs to the per-record
                 // weapon texture (see `weapon_fuse`) - no sibling
                 // islands there.
@@ -395,7 +446,8 @@ pub(super) fn relayout_to_band(
     if free_cols.is_empty() {
         bail!("record[0] claims every CLUT column of the band row");
     }
-    let (group_of, group_colors) = merge_palettes(&used, cluts, free_cols.len(), warnings)?;
+    let (group_of, group_colors) =
+        merge_palettes(&used, cluts, free_cols.len(), idx0_opaque, warnings)?;
     if group_colors.len() > free_cols.len() {
         bail!(
             "{} palette groups but only {} free CLUT columns",
@@ -446,7 +498,7 @@ pub(super) fn relayout_to_band(
                     }
                     let idx = src_texel(f.page, sx, sy) as usize;
                     let color = cluts[src_pal][idx];
-                    let new_idx = if idx == 0 || color == 0 {
+                    let new_idx = if (idx == 0 && !idx0_opaque) || color == 0 {
                         0
                     } else {
                         match colors.iter().position(|&cc| cc == color) {
