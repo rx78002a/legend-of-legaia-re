@@ -1171,6 +1171,51 @@ fn scale_object(o: &mut ModelObject, s: f32) -> Result<()> {
     Ok(())
 }
 
+/// Nominal CLUT row and texture-page column of a monster's own prims: the
+/// battle loader (`FUN_80055468`) **adds** `slot + 3` to every prim's CLUT row
+/// and `slot + 0x10` to its TSB word, so row 481 / column 5 land on the slot's
+/// own CLUT row `484 + slot` and page `5 + slot`.
+const NOMINAL_CLUT_ROW: u16 = 481;
+const NOMINAL_PAGE_COL: u16 = 5;
+
+/// The late bosses (ids 179..=186: Songi's third form, the Corts, Koru) carry
+/// prims authored one row and one page past their own: the loader relocates
+/// them onto the **next slot's** CLUT row and texture page, which holds
+/// nothing of the boss's. Re-laying them out against the boss's own pool shows
+/// the wrong texels (Cort: a strip of cloak across half the face). A small
+/// number of them is dropped (the layer under them, hair for Cort, shows
+/// instead); a boss with many keeps them and warns.
+fn drop_foreign_prims(objects: &mut [ModelObject], warnings: &mut Vec<String>) {
+    let foreign = |p: &legaia_tmd::encode::ModelPrim| {
+        !p.uvs.is_empty() && ((p.cba >> 6) != NOMINAL_CLUT_ROW || (p.tsb & 0xF) != NOMINAL_PAGE_COL)
+    };
+    let (mut bad, mut total) = (0usize, 0usize);
+    for o in objects.iter() {
+        for g in &o.groups {
+            total += g.prims.iter().filter(|p| !p.uvs.is_empty()).count();
+            bad += g.prims.iter().filter(|p| foreign(p)).count();
+        }
+    }
+    if bad == 0 {
+        return;
+    }
+    if bad * 20 > total {
+        warnings.push(format!(
+            "{bad} of {total} textured prims address the next slot's texture page; kept as authored"
+        ));
+        return;
+    }
+    for o in objects.iter_mut() {
+        for g in &mut o.groups {
+            g.prims.retain(|p| !foreign(p));
+        }
+        o.groups.retain(|g| !g.prims.is_empty());
+    }
+    warnings.push(format!(
+        "{bad} of {total} textured prims address the next slot's texture page and were dropped"
+    ));
+}
+
 pub fn boss_geometry(
     player_file: &[u8],
     rig: &PlayerRig,
@@ -1195,6 +1240,7 @@ pub fn boss_geometry(
         .texture_pool_bytes()
         .ok_or_else(|| anyhow::anyhow!("monster id {id}: no texture pool"))?;
     let (cluts, indices, width) = monster_pool_texels(pool)?;
+    drop_foreign_prims(&mut objects, &mut warnings);
     for o in objects.iter_mut() {
         scale_object(o, scale)?;
         compact_object(o);

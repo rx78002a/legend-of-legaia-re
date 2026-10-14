@@ -294,6 +294,36 @@ fn monster(args: &[String]) -> Result<()> {
         .iter()
         .map(|p| mesh_raster::Pose::from_keyframe([p.tx, p.ty, p.tz], [p.rx, p.ry, p.rz]))
         .collect();
+    // Probe: BOSS_FOREIGN_PAL=k repaints the prims whose nominal CLUT row or
+    // page column is not the monster's own (row 481 / column 5) with palette k
+    // on the monster's own page.
+    if let Some(k) = std::env::var("BOSS_FOREIGN_PAL")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+    {
+        let orig = legaia_tmd::mesh::tmd_to_vram_mesh(&tmd, mesh.tmd_bytes());
+        let foreign: Vec<bool> = orig
+            .cba_tsb
+            .iter()
+            .map(|ct| (ct[0] >> 6) != 481 || (ct[1] & 0xF) != 5)
+            .collect();
+        if k == 99 {
+            // drop the foreign prims altogether
+            vm.indices = vm
+                .indices
+                .chunks(3)
+                .filter(|t| t.iter().all(|&i| !foreign[i as usize]))
+                .flatten()
+                .copied()
+                .collect();
+        }
+        for (i, ct) in orig.cba_tsb.iter().enumerate() {
+            if k != 99 && foreign[i] {
+                vm.cba_tsb[i][0] = monster_archive::relocate_cba(k, 0);
+                vm.cba_tsb[i][1] = monster_archive::relocate_tsb(0x25, 0);
+            }
+        }
+    }
     if !only.is_empty() {
         let keep: Vec<u32> = vm
             .indices
@@ -307,7 +337,11 @@ fn monster(args: &[String]) -> Result<()> {
     let opts = mesh_raster::RasterOptions {
         width: 600,
         height: 600,
-        yaw: 20f32.to_radians(),
+        yaw: std::env::var("BOSS_YAW")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(20.0)
+            .to_radians(),
         pitch: -10f32.to_radians(),
         margin: 0.04,
         background: [40, 44, 56, 255],
