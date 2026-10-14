@@ -5,7 +5,7 @@ use legaia_disc_patch::ppf;
 
 fn usage() -> ! {
     eprintln!(
-        "usage: boss-swap build <disc.bin|.cue> <out.ppf> [--monster N] [--scale F] [--classic] [--keep-voices]\n       \
+        "usage: boss-swap build <disc.bin|.cue> <out.ppf> [--monster N] [--scale F] [--no-fireball] [--fireball-art NAME] [--keep-voices]\n       \
          (writes a PPF 3.0 patch; the disc image is never modified)"
     );
     std::process::exit(2);
@@ -36,9 +36,13 @@ fn main() -> Result<()> {
                 opts.scale = args.get(i + 1).context("--scale F")?.parse()?;
                 i += 2;
             }
-            "--classic" => {
-                opts.fireball = false;
+            "--no-fireball" => {
+                opts.fireball_art = None;
                 i += 1;
+            }
+            "--fireball-art" => {
+                opts.fireball_art = Some(args.get(i + 1).context("--fireball-art NAME")?.clone());
+                i += 2;
             }
             "--keep-voices" => {
                 opts.mute_host_voice = false;
@@ -108,9 +112,13 @@ fn render(args: &[String]) -> Result<()> {
                 cell = args[i + 1].parse()?;
                 i += 2;
             }
-            "--classic" => {
-                opts.fireball = false;
+            "--no-fireball" => {
+                opts.fireball_art = None;
                 i += 1;
+            }
+            "--fireball-art" => {
+                opts.fireball_art = Some(args.get(i + 1).context("--fireball-art NAME")?.clone());
+                i += 2;
             }
             "--keep-voices" => {
                 opts.mute_host_voice = false;

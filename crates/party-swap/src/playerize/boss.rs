@@ -267,9 +267,6 @@ pub struct ClipMap {
     /// Victory source and the idle it settles into.
     pub victory: usize,
     pub idle: usize,
-    /// Fireball mode: every swing and art plays this one clip (the boss's
-    /// cast, retimed to release on its first hit event).
-    pub fireball: Option<usize>,
 }
 
 fn find_tag(clips: &[BossClip], tag: u8) -> Option<usize> {
@@ -323,25 +320,23 @@ pub fn default_clip_map(clips: &[BossClip]) -> Result<ClipMap> {
         walk,
         victory,
         idle,
-        fireball: None,
     })
 }
 
-/// Frames of the Spirit-charge hold stream (main ME entry 0 is addressed up
-/// to row 58).
-const CHARGE_FRAMES: usize = 59;
-/// Frames between consecutive hits of a multi-hit art in fireball mode.
+/// Frames between consecutive hits of a multi-hit art playing the fireball.
 const FIREBALL_HIT_GAP: usize = 2;
 /// `[count, start, end]` hold window the boss's own cast uses to charge.
 const FIREBALL_LOOP: (u8, usize, usize) = (10, 10, 11);
+/// Inline name the fireball art is given (HUD banner).
+const FIREBALL_NAME: &str = "Hyper Wave";
+/// Main ME entry the fireball art streams from (the first spare stub).
+const FIREBALL_ENTRY: usize = 6;
 
-/// Append the two fireball clips to `clips` and return the map in which every
-/// swing and art plays them: the boss's cast clip (tag `0x23`) with its
-/// move-power terminator record dropped (a party actor has no monster move
-/// power to install) and one hit event on the frame that record sat on, and a
-/// copy padded to the Spirit-charge length for main ME entry 0.
-pub fn fireball_map(clips: &mut Vec<BossClip>) -> Result<ClipMap> {
-    let mut map = default_clip_map(clips)?;
+/// Append the boss's cast clip (tag `0x23`) to `clips` as a player art clip
+/// and return its index: its move-power terminator record is dropped (a
+/// party actor has no monster move power to install), one hit event takes the
+/// frame that record sat on, and it runs at twice the monster's cast rate.
+pub fn add_fireball_clip(clips: &mut Vec<BossClip>) -> Result<usize> {
     let cast = find_tag(clips, 0x23).context("boss has no tag 0x23 cast clip")?;
     let mut play = clips[cast].clone();
     let mut release = None;
@@ -355,19 +350,8 @@ pub fn fireball_map(clips: &mut Vec<BossClip>) -> Result<ClipMap> {
     let release = release.unwrap_or((play.len() as u8).saturating_sub(9).max(1));
     play.head[0x10..0x14].copy_from_slice(&[release, 0, 0, 0]);
     play.head[0x78] = play.head[0x78].max(2);
-    let mut charge = play.clone();
-    while charge.frames.len() < CHARGE_FRAMES {
-        let last = charge.frames.last().cloned().unwrap_or_default();
-        charge.frames.push(last);
-    }
-    let (a, p) = (clips.len(), clips.len() + 1);
     clips.push(play);
-    clips.push(charge);
-    map.swings = [a; 4];
-    map.single_hit = vec![a; 4];
-    map.multi_hit = p;
-    map.fireball = Some(a);
-    Ok(map)
+    Ok(clips.len() - 1)
 }
 
 /// Fireball timing for an art record entry: `hits` beats from the release
@@ -440,6 +424,10 @@ pub struct ArtUse {
     /// archive stores each boss clip once).
     pub new_source: usize,
     pub hits: usize,
+    /// Inline art name (record `+0x10`).
+    pub name: String,
+    /// This record plays the fireball clip.
+    pub fireball: bool,
 }
 
 /// What a main-archive entry holds.
@@ -460,6 +448,8 @@ pub struct BossPlan {
     pub main_entries: Vec<MainEntry>,
     /// Base archive entry count (all carry the victory composite).
     pub base_entries: usize,
+    /// The fireball clip, when an art plays it.
+    pub fireball: Option<usize>,
 }
 
 fn power_hits(rec: &[u8]) -> usize {
@@ -476,15 +466,24 @@ pub fn plan_boss(
     main_entries: usize,
     base_entries: usize,
 ) -> Result<BossPlan> {
-    plan_boss_with(rec0, default_clip_map(clips)?, main_entries, base_entries)
+    plan_boss_with(
+        rec0,
+        default_clip_map(clips)?,
+        main_entries,
+        base_entries,
+        None,
+    )
 }
 
 /// [`plan_boss`] over an explicit clip map (see [`fireball_map`]).
+/// `fireball` is `(clip index, art name)`: the art record of that inline name
+/// plays the clip instead of a melee move.
 pub fn plan_boss_with(
     rec0: &Record0,
     map: ClipMap,
     main_entries: usize,
     base_entries: usize,
+    fireball: Option<(usize, &str)>,
 ) -> Result<BossPlan> {
     let bank_off = rec0.word(BANK_WORD);
     let count = rec0.word(bank_off);
@@ -504,6 +503,14 @@ pub fn plan_boss_with(
             stream_source: rec[0x0A] as usize,
             new_source: rec[0x0A] as usize,
             hits: power_hits(rec),
+            name: String::from_utf8_lossy(
+                rec[0x10..ART_ENTRY]
+                    .split(|&b| b == 0)
+                    .next()
+                    .unwrap_or(&[]),
+            )
+            .into_owned(),
+            fireball: false,
         });
     }
     if main_entries < 6 {
@@ -521,11 +528,7 @@ pub fn plan_boss_with(
     main[5] = MainEntry::Clip(map.walk);
     let mut single_i = 0usize;
     for a in arts.iter_mut().filter(|a| !a.base) {
-        a.new_source = if map.fireball.is_some() && a.hits > 0 {
-            // Entry 0 is the padded charge stream; arts play the real clip.
-            single_i += 1;
-            1 + (single_i - 1) % 4
-        } else if a.stream_source == 0 {
+        a.new_source = if a.stream_source == 0 {
             0
         } else if a.hits == 0 {
             5
@@ -536,11 +539,26 @@ pub fn plan_boss_with(
             0
         };
     }
+    let mut fireball_clip = None;
+    if let Some((clip, name)) = fireball {
+        if main_entries <= FIREBALL_ENTRY {
+            bail!("main ME archive has no spare entry for the fireball");
+        }
+        let art = arts
+            .iter_mut()
+            .find(|a| !a.base && a.name.eq_ignore_ascii_case(name))
+            .with_context(|| format!("no art record named {name:?}"))?;
+        art.fireball = true;
+        art.new_source = FIREBALL_ENTRY;
+        main[FIREBALL_ENTRY] = MainEntry::Clip(clip);
+        fireball_clip = Some(clip);
+    }
     Ok(BossPlan {
         map,
         arts,
         main_entries: main,
         base_entries,
+        fireball: fireball_clip,
     })
 }
 
@@ -634,6 +652,11 @@ pub fn rebuild_record0(
         if !a.base {
             out[b + 0x0A] = a.new_source as u8;
         }
+        if a.fireball {
+            let name = FIREBALL_NAME.as_bytes();
+            out[b + 0x10..b + ART_ENTRY].fill(0);
+            out[b + 0x10..b + 0x10 + name.len()].copy_from_slice(name);
+        }
         let entry = &mut out[b + ART_ENTRY..b + ART_STRIDE];
         if a.base {
             let (cnt, s, e) = victory_window(plan, clips);
@@ -642,8 +665,8 @@ pub fn rebuild_record0(
         } else {
             apply_clip_head(entry, clip, n, Kind::Attack);
             clamp_loop(entry, n);
-            if plan.map.fireball.is_some() && a.hits > 0 {
-                fireball_timing(entry, clip, a.hits, n);
+            if a.fireball {
+                fireball_timing(entry, clip, a.hits.max(1), n);
             }
         }
     }
@@ -939,20 +962,11 @@ pub fn boss_geometry(
 // The whole player file
 
 /// Replacement for the swing record `old` (head + stream) playing `clip`.
-fn swing_entry(
-    old: &[u8],
-    clip: &BossClip,
-    rig: &PlayerRig,
-    scale: f32,
-    fireball: bool,
-) -> Vec<u8> {
+fn swing_entry(old: &[u8], clip: &BossClip, rig: &PlayerRig, scale: f32) -> Vec<u8> {
     let parts = old[PLAYER_HEAD] as usize;
     let mut e = old[..PLAYER_HEAD].to_vec();
     apply_clip_head(&mut e, clip, clip.len(), Kind::Attack);
     clamp_loop(&mut e, clip.len());
-    if fireball {
-        fireball_timing(&mut e, clip, 1, clip.len());
-    }
     e.extend_from_slice(&player_stream(&clip.frames, rig, parts, scale));
     e
 }
@@ -1069,7 +1083,6 @@ pub fn bossize_player_file(
                 &clips[plan.map.swings[slot - 0xC]],
                 rig,
                 scale,
-                plan.map.fireball.is_some(),
             ))
         })
         .with_context(|| format!("swap swing records of record {idx}"))?;

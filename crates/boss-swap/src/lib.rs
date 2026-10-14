@@ -25,9 +25,9 @@ pub struct Options {
     pub monster: u16,
     /// Uniform scale applied to the boss geometry and pose translations.
     pub scale: f32,
-    /// Every swing and art plays the boss's cast (its fireball), not the
-    /// boss's melee moves.
-    pub fireball: bool,
+    /// The art record (by inline name) that plays the boss's cast - its
+    /// fireball - instead of a melee move. `None` keeps melee everywhere.
+    pub fireball_art: Option<String>,
     /// Mute the host character's own voice banks (arts shout, fanfares,
     /// swing grunt, victory barks).
     pub mute_host_voice: bool,
@@ -38,7 +38,7 @@ impl Default for Options {
         Self {
             monster: 76,
             scale: 0.8,
-            fireball: true,
+            fireball_art: Some("Somersault".to_string()),
             mute_host_voice: true,
         }
     }
@@ -77,9 +77,10 @@ pub fn apply(patcher: &mut DiscPatcher, opts: &Options) -> Result<Report> {
 
     let mut clips = boss::boss_clips(&archive, opts.monster)?;
     let rec0 = boss::Record0::parse(&player)?;
-    let plan = if opts.fireball {
-        let map = boss::fireball_map(&mut clips)?;
-        boss::plan_boss_with(&rec0, map, main_n, base_n)?
+    let plan = if let Some(art) = &opts.fireball_art {
+        let fireball = boss::add_fireball_clip(&mut clips)?;
+        let map = boss::default_clip_map(&clips)?;
+        boss::plan_boss_with(&rec0, map, main_n, base_n, Some((fireball, art.as_str())))?
     } else {
         boss::plan_boss(&rec0, &clips, main_n, base_n)?
     };
