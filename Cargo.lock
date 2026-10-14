@@ -1332,6 +1332,8 @@ dependencies = [
  "legaia-disc-patch",
  "legaia-iso",
  "legaia-party-swap",
+ "legaia-tim",
+ "legaia-tmd",
  "png",
 ]
 

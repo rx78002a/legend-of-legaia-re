@@ -17,5 +17,7 @@ anyhow.workspace = true
 legaia-actor-formats.workspace = true
 legaia-disc-patch.workspace = true
 legaia-iso.workspace = true
+legaia-tim.workspace = true
+legaia-tmd.workspace = true
 legaia-party-swap.workspace = true
 png.workspace = true

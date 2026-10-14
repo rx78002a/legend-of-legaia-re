@@ -224,6 +224,10 @@ pub(in super::super) fn nearest_color(colors: &[u16], c: u16) -> usize {
     best
 }
 
+fn face_palette(objects: &[ModelObject], f: &FaceRef) -> u16 {
+    objects[f.obj].groups[f.group].prims[f.prim].cba & 0x3F
+}
+
 /// The re-laid band texture: per-section pool blocks + per-face rewrites.
 pub(super) struct BandLayout {
     /// Per-section `[u16 clut_x][u16 clut_n][cluts][pixels]` pool bytes.
@@ -275,7 +279,13 @@ pub(super) fn relayout_to_band(
     }
     for i in 0..faces.len() {
         for j in (i + 1)..faces.len() {
-            if boxes_touch(faces[i].bbox, faces[j].bbox) {
+            // Faces on different source palettes never share an island:
+            // the same texels recoloured through two CLUTs (palette swaps)
+            // would otherwise collide on one band tile and the second
+            // palette's faces would sample the first's index values.
+            if face_palette(objects, &faces[i]) == face_palette(objects, &faces[j])
+                && boxes_touch(faces[i].bbox, faces[j].bbox)
+            {
                 let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
                 if ri != rj {
                     parent[ri] = rj;

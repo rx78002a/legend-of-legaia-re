@@ -18,6 +18,7 @@ fn write_png(path: &Path, w: usize, h: usize, rgba: &[u8]) -> Result<()> {
 
 /// Render `frames_per_clip` evenly spaced frames of every clip into one PNG
 /// strip per clip under `out_dir`.
+#[allow(clippy::too_many_arguments)]
 pub fn render_clips(
     player_file: &[u8],
     readef: &[u8],
@@ -26,6 +27,8 @@ pub fn render_clips(
     frames_per_clip: usize,
     cell: usize,
     yaw_deg: f32,
+    equipped: [u8; 5],
+    only: &[u32],
 ) -> Result<Vec<String>> {
     std::fs::create_dir_all(out_dir)?;
     // Art clips straight from the (patched) readef archives.
@@ -60,8 +63,46 @@ pub fn render_clips(
             anim,
         });
     }
-    let c = loadout::build(player_file, cslot, [0; 5], false, &arts)
+    let mut c = loadout::build(player_file, cslot, equipped, false, &arts)
         .map_err(|e| anyhow::anyhow!("assemble: {e}"))?;
+    {
+        let pack = legaia_actor_formats::battle_data_pack::parse(player_file)
+            .map_err(|e| anyhow::anyhow!("pack: {e}"))?;
+        for (i, cat) in loadout::section_catalog(&pack).iter().enumerate() {
+            println!("section {i}: ids {:?}", cat.ids);
+        }
+    }
+    {
+        let mut cnt = std::collections::BTreeMap::new();
+        for &o in &c.object_ids {
+            *cnt.entry(o).or_insert(0usize) += 1;
+        }
+        for o in 0..c.part_count as u32 {
+            let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+            for (v, &id) in c.mesh.positions.iter().zip(&c.object_ids) {
+                if id == o {
+                    for a in 0..3 {
+                        lo[a] = lo[a].min(v[a]);
+                        hi[a] = hi[a].max(v[a]);
+                    }
+                }
+            }
+            println!("obj {o} local bbox {lo:?} .. {hi:?}");
+        }
+        println!("object vertex counts {cnt:?}; bones {:?}", c.anm_bones);
+    }
+    if !only.is_empty() {
+        let ids = c.object_ids.clone();
+        let keep: Vec<u32> = c
+            .mesh
+            .indices
+            .chunks(3)
+            .filter(|t| t.iter().all(|&i| only.contains(&ids[i as usize])))
+            .flatten()
+            .copied()
+            .collect();
+        c.mesh.indices = keep;
+    }
     let opts = RasterOptions {
         width: cell,
         height: cell,

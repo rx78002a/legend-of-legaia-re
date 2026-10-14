@@ -191,7 +191,7 @@ fn apply_clip_head(entry: &mut [u8], clip: &BossClip, nframes: usize, kind: Kind
         }
     }
     entry[0x14..0x54].copy_from_slice(&h[0x14..0x54]);
-    entry[0x54..0x74].copy_from_slice(&h[0x54..0x74]);
+    entry[0x54..0x74].copy_from_slice(&strip_voice_cues(&h[0x54..0x74]));
     entry[0x78] = h[0x78].max(1);
     // Face tracks and equipment-variant windows belong to the host's
     // face and weapon, not to the boss.
@@ -206,6 +206,27 @@ fn apply_clip_head(entry: &mut [u8], clip: &BossClip, nframes: usize, kind: Kind
             }
         }
     }
+}
+
+/// Sound cues are `[u16 frame][u16 id]` pairs. For a party actor an id
+/// `>= 0x100` selects an XA voice line by position in the *party's* voice
+/// table, so a boss's own voice ids would play whatever party line sits at
+/// that slot - long, unrelated shouts. Drop those pairs and close the gap
+/// (a zero pair ends the list); the effect ids below `0x100` keep playing.
+fn strip_voice_cues(cues: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(cues.len());
+    for pair in cues.chunks_exact(4) {
+        let id = u16::from_le_bytes([pair[2], pair[3]]);
+        if id >= 0x100 {
+            continue;
+        }
+        if pair == [0, 0, 0, 0] {
+            break;
+        }
+        out.extend_from_slice(pair);
+    }
+    out.resize(cues.len(), 0);
+    out
 }
 
 fn set_loop(entry: &mut [u8], count: u8, start: usize, end: usize) {
