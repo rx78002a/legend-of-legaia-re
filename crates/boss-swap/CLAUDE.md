@@ -10,8 +10,8 @@ Staged plan:
 
 1. Model, own motions, one art that fires the monster's spell: **done**.
 2. Special techniques are the boss's fireball, cast in place: **built** (`direct_cast`). Somersault (Up, Down, Up) casts the fireball swing with no walk and no leading arrows; a bare Up plays its own melee (record[0] row `0x0A`); every other input plays as before. More cast arts (Cort's spells) and a magic-window entry are the open follow-ups.
-3. Monster stats and voices: **open**.
-4. More monsters (Songi `#76` "Songi (1st)" is the reference; `#136` and other bosses next): **open**.
+3. Monster stats and voices: **open**. Voices are feasible with the Delilas precedent (`delilas-party`, `delilas_xa_voice`: the donor's `monster.snd` SPU samples decode, resample and XA-encode into the muted hero channels); the boss's own clips carry cues `>= 0x100` (Songi #76: `0x178..=0x17F`) that are stripped today and would be remapped onto the host's staged-event voice ids.
+4. More monsters (Songi `#76` "Songi (1st)" is the reference). `#136` "Songi (2nd)" builds as a melee-only host (see below); its specials are cast-module cinematics. Cort and other bosses next: **open**.
 
 ## Commands
 
@@ -37,6 +37,13 @@ The PPF is diffed against an in-memory copy; the ISO is never modified. Defaults
 - **Calm support clips** (`add_calm_clips`): slot 9 and Spirit play the boss idle (cycled to 59 frames for Spirit) with an idle head, so no hit event, effect or sound rides along.
 - **Textures**: `relayout_to_band` clusters UV islands per source palette (`face_palette = cba & 0x3F`); the downscale ladder `[1, 2, 4]` is tried until the member limit holds.
 - **Voices**: Vahn's lines live in XA files and are muted with `DiscPatcher::silence_xa_file` / `silence_xa_channels` (`XA1`, `XA2`, `XA27` whole; `XA30` channel 0; `XA21` channels 2, 3).
+
+## Other bosses
+
+- The clip map takes the tag-`0x0E` single-hit moves first, then any other single-hit attack, then multi-hit attacks, cycled to four swings; a boss with fewer is padded rather than refused.
+- A boss whose cast clips carry no move-power terminator (its specials are cast-module cinematics, spell class `'c'`) gets no fireball: `apply` notes it and builds the melee set without the direct-cast hooks. Songi #136 is this case: magic ids `0x4B` Hyper Crush and `0x4C` Hyper Lightning, cast modules PROT 936 / 937, three tag-`0x23` clips with no effect script. A player-caster route needs the per-module edit sets `delilas-party` carries for 958 / 959 / 960.
+- Long clips overflow record[0] (`record[0] ... leaves no room for the descriptor table below 0x8000`): `apply` retries with clips longer than 40, 30, then 22 frames decimated (`BossClip::decimated`: half the poses, twice the rate, every frame-indexed head field halved). Songi #136 needs the 30-frame cap. #76 is unchanged by the retry.
+- The HUD name over the host is the replaced character's own ("Vahn"); renaming it means the new-game template and the save record name, not this crate.
 
 ## Monster clip tags (Songi `#76`)
 

@@ -78,8 +78,47 @@ pub struct Report {
     pub notes: Vec<String>,
 }
 
+/// Clip lengths above which a clip is decimated (half the frames, twice the
+/// rate) when the rebuilt player file does not fit; `None` keeps every pose.
+const DECIMATE_CAPS: [Option<usize>; 4] = [None, Some(40), Some(30), Some(22)];
+
 /// Apply the boss swap to Vahn's slot. Writes through `patcher`.
+///
+/// A boss with long clips can overflow the player file; the build then
+/// retries with its longest clips decimated. Nothing is written before the
+/// size checks, so a retry starts from the untouched image.
 pub fn apply(patcher: &mut DiscPatcher, opts: &Options) -> Result<Report> {
+    let mut last = None;
+    for cap in DECIMATE_CAPS {
+        match apply_with(patcher, opts, cap) {
+            Ok(mut report) => {
+                if let Some(cap) = cap {
+                    report.notes.push(format!(
+                        "clips longer than {cap} frames decimated (half the poses, twice the rate)"
+                    ));
+                }
+                return Ok(report);
+            }
+            Err(e) => {
+                let text = format!("{e:#}");
+                let size = text.contains("no room for the descriptor table")
+                    || text.contains("member buffer")
+                    || text.contains("needs") && text.contains("bytes, the slot holds");
+                if !size {
+                    return Err(e);
+                }
+                last = Some(e);
+            }
+        }
+    }
+    Err(last.expect("at least one attempt"))
+}
+
+fn apply_with(
+    patcher: &mut DiscPatcher,
+    opts: &Options,
+    decimate_over: Option<usize>,
+) -> Result<Report> {
     let mut report = Report::default();
     let archive = patcher
         .read_entry_footprint(MONSTER_ARCHIVE_ENTRY)
@@ -105,7 +144,29 @@ pub fn apply(patcher: &mut DiscPatcher, opts: &Options) -> Result<Report> {
     let base_n = me_archive::parse(slot_bytes(base_slot)?)?.len();
 
     let mut clips = boss::boss_clips(&archive, opts.monster)?;
+    if let Some(cap) = decimate_over {
+        for c in &mut clips {
+            if c.len() > cap {
+                *c = c.decimated(2);
+            }
+        }
+    }
     let rec0 = boss::Record0::parse(&player)?;
+    // The fireball needs a cast clip that ends in a move-power terminator. A
+    // boss whose specials are cast-module cinematics has none: it plays its
+    // melee set only.
+    let mut local = opts.clone();
+    if (opts.fireball_swing || opts.fireball_art.is_some())
+        && let Err(e) = boss::add_fireball_clip(&mut clips.clone())
+    {
+        report.notes.push(format!(
+            "no fireball: {e:#} (melee set only, no direct-cast hooks)"
+        ));
+        local.fireball_swing = false;
+        local.fireball_art = None;
+        local.direct_cast = false;
+    }
+    let opts = &local;
     let fireball = if opts.fireball_art.is_some() {
         Some(boss::add_fireball_clip(&mut clips)?)
     } else {

@@ -75,6 +75,44 @@ impl BossClip {
         self.frames.is_empty()
     }
 
+    /// The clip at half the frames and twice the rate: same duration, every
+    /// second pose dropped. Every frame-indexed head field moves with it - hit
+    /// events, effect-script frames, sound cues and the loop window. For a
+    /// boss whose long clips overflow the player file's record[0] budget.
+    pub fn decimated(&self, k: usize) -> BossClip {
+        let k = k.max(1);
+        let frames: Vec<_> = self.frames.iter().step_by(k).cloned().collect();
+        let mut head = self.head.clone();
+        let scale = |f: u8| ((f as usize / k).min(255)) as u8;
+        for b in &mut head[0x10..0x14] {
+            if *b != 0 {
+                *b = scale(*b).max(1);
+            }
+        }
+        for r in 0..8 {
+            let o = 0x14 + r * 8;
+            if head[o + 1] != 0 || head[o + 2..o + 8].iter().any(|&b| b != 0) {
+                head[o] = scale(head[o]);
+            }
+        }
+        for o in (0x54..0x74).step_by(4) {
+            if head[o + 2] != 0 || head[o + 3] != 0 {
+                let f = u16::from_le_bytes([head[o], head[o + 1]]) as usize / k;
+                head[o..o + 2].copy_from_slice(&(f as u16).to_le_bytes());
+            }
+        }
+        if head[0x84] != 0 {
+            head[0x85] = scale(head[0x85]);
+            head[0x86] = scale(head[0x86]).max(head[0x85].saturating_add(1));
+        }
+        head[0x78] = (head[0x78].max(1) as usize * k).min(255) as u8;
+        BossClip {
+            frames,
+            head,
+            ..self.clone()
+        }
+    }
+
     /// Non-zero hit-event frames (entry `+0x10..+0x13`).
     pub fn events(&self) -> Vec<u8> {
         self.head[0x10..0x14]
@@ -297,20 +335,41 @@ pub fn default_clip_map(clips: &[BossClip]) -> Result<ClipMap> {
     slots.insert(7, idle);
     slots.insert(8, idle);
     slots.insert(9, need(4)?);
-    let singles: Vec<usize> = clips
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| c.tag == 0x0E && c.events().len() == 1)
-        .map(|(i, _)| i)
-        .collect();
-    if singles.len() < 4 {
-        bail!("boss has {} single-hit 0x0E moves, need 4", singles.len());
+    // Melee moves, best fit first: the tag-0x0E single-hit moves, then any
+    // other single-hit attack, then the multi-hit attacks; cycled to four.
+    let attack = |c: &BossClip| (0x0C..=0x1F).contains(&c.tag) && !c.events().is_empty();
+    let mut singles: Vec<usize> = Vec::new();
+    for pass in 0..3 {
+        for (i, c) in clips.iter().enumerate() {
+            let fits = match pass {
+                0 => c.tag == 0x0E && c.events().len() == 1,
+                1 => attack(c) && c.events().len() == 1,
+                _ => attack(c) && c.events().len() >= 2,
+            };
+            if fits && !singles.contains(&i) {
+                singles.push(i);
+            }
+        }
+    }
+    if singles.is_empty() {
+        bail!("boss has no attack clip with a hit event");
+    }
+    let found = singles.len();
+    while singles.len() < 4 {
+        singles.push(singles[singles.len() % found]);
     }
     let multi = clips
         .iter()
         .enumerate()
         .filter(|(_, c)| c.events().len() >= 2 && (0x0C..=0x1F).contains(&c.tag))
         .max_by_key(|(_, c)| c.len())
+        .or_else(|| {
+            clips
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| attack(c))
+                .max_by_key(|(_, c)| c.len())
+        })
         .map(|(i, _)| i)
         .context("boss has no multi-hit move")?;
     let victory = find_tag(clips, 0x22).unwrap_or(idle);
