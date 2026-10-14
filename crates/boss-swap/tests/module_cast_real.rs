@@ -32,32 +32,33 @@ fn word(entry: &[u8], va: u32) -> u32 {
 
 fn check(p: &DiscPatcher) {
     let l = module_cast::layout();
-    // applier call redirected to the route stub
+    // applier call redirected to the route stub, debit to the prep helper
     let overlay = p.read_entry(898).unwrap();
-    let at = (0x801E_F9ACu32 - 0x801C_E818) as usize;
-    assert_eq!(
-        u32::from_le_bytes(overlay[at..at + 4].try_into().unwrap()),
-        m::jal(SCUS_GAP_VA)
-    );
-    // stub, table and helpers in SCUS
+    let ov = |va: u32| {
+        let at = (va - 0x801C_E818) as usize;
+        u32::from_le_bytes(overlay[at..at + 4].try_into().unwrap())
+    };
+    assert_eq!(ov(0x801E_F9AC), m::jal(SCUS_GAP_VA));
+    assert_eq!(ov(0x801E_4584), m::jal(l.prep));
+    // stub, helper and tables in SCUS
     let scus = p.read_named_file("SCUS_942.54").unwrap();
     let off = |va: u32| legaia_game_tables::item_names::file_offset_for_va(&scus, va).unwrap();
-    let route = module_cast::assemble_route(l.table, l.credit);
+    let route = module_cast::assemble_route(l.table);
     assert_eq!(&scus[off(SCUS_GAP_VA)..][..route.len()], route.as_slice());
+    let prep = module_cast::assemble_prep(&l);
+    assert_eq!(&scus[off(l.prep)..][..prep.len()], prep.as_slice());
     assert_eq!(scus[off(l.table) + 0x27 - 0x10], 0x4B);
     assert_eq!(scus[off(l.table) + 0x29 - 0x10], 0x4C);
-    let end = module_cast::assemble_end();
-    assert_eq!(&scus[off(l.end)..][..end.len()], end.as_slice());
     // module words
     let m936 = p.read_entry(936).unwrap();
-    for e in module_cast::edits_936(&l) {
+    for e in module_cast::edits_936() {
         assert_eq!(word(&m936, e.va), e.replace, "936 {:#x}", e.va);
     }
     let m937 = p.read_entry(937).unwrap();
     for e in module_cast::edits_937() {
         assert_eq!(word(&m937, e.va), e.replace, "937 {:#x}", e.va);
     }
-    // stage rows authored in record[0]
+    // stage rows authored in record[0], the pool entries behind the table
     let r0 = Record0::parse(&p.read_entry_footprint(863).unwrap()).unwrap();
     for row in [0x0A, 0x06] {
         let (parts, frames) = r0.stream_shape(row).expect("row");
@@ -65,6 +66,20 @@ fn check(p: &DiscPatcher) {
         let at = r0.entry_offset(row).unwrap();
         assert_eq!(r0.decoded[at + 0x77], 0x0A, "attach key");
         assert_eq!(r0.decoded[at + 0x84], 0xFF, "hold window");
+    }
+    for (spell, slot) in [(0x4Bu8, 0usize), (0x4C, 1)] {
+        let at = off(l.rows) + slot * 2;
+        let entry = u16::from_le_bytes(scus[at..at + 2].try_into().unwrap()) as usize;
+        assert!(entry != 0, "spell {spell:#x} has a pool entry");
+        assert!(entry + 0xAC + 2 < r0.decoded.len(), "inside record[0]");
+        assert!(entry < r0.clut_a, "below the load-time scratch");
+        let (parts, frames) = (
+            r0.decoded[entry + 0xAC] as usize,
+            r0.decoded[entry + 0xAD] as usize,
+        );
+        assert!(parts > 0 && frames > 0, "spell {spell:#x} pool stream");
+        assert_eq!(r0.decoded[entry + 0x77], 0x0A);
+        assert_eq!(r0.decoded[entry + 0x84], 0xFF);
     }
 }
 
@@ -84,8 +99,20 @@ fn route_lands_on_the_patched_image() {
             spell: 0x4C,
         },
     ];
+    // the pool offsets the build chose, read back from the installed table
+    let scus = p.read_named_file("SCUS_942.54").unwrap();
+    let l = module_cast::layout();
+    let at = legaia_game_tables::item_names::file_offset_for_va(&scus, l.rows).unwrap();
+    let pool: Vec<(u8, usize)> = [0x4Bu8, 0x4C]
+        .iter()
+        .enumerate()
+        .map(|(i, &sp)| {
+            let off = u16::from_le_bytes(scus[at + i * 2..at + i * 2 + 2].try_into().unwrap());
+            (sp, usize::from(off))
+        })
+        .collect();
     assert!(
-        !module_cast::install(&mut p, &specials).unwrap(),
+        !module_cast::install(&mut p, &specials, &pool).unwrap(),
         "second install is a no-op"
     );
 }

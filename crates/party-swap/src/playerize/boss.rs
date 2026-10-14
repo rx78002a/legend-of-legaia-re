@@ -420,6 +420,15 @@ pub fn stage_entry(
     e
 }
 
+/// A stage pose as the plan wants it embedded.
+fn stage_clip(plan: &BossPlan, clip: &BossClip) -> BossClip {
+    if plan.decimate_stage {
+        clip.decimated(2)
+    } else {
+        clip.clone()
+    }
+}
+
 /// Frames between consecutive hits of a multi-hit art playing the fireball.
 const FIREBALL_HIT_GAP: usize = 2;
 /// `[count, start, end]` hold window the boss's own cast uses to charge.
@@ -591,10 +600,18 @@ pub struct BossPlan {
     /// `(record[0] row, clip)`: placeholder rows authored as caster stage
     /// poses for the cast-module route (see [`stage_entry`]).
     pub stage_rows: Vec<(usize, usize)>,
+    /// Clips authored as extra stage entries after the slot entries, outside
+    /// the 12-word table: a cast stub repoints a table word at one of them at
+    /// run time. Their record[0] offsets come back in
+    /// [`Bossized::pool_offsets`].
+    pub stage_pool: Vec<usize>,
     /// Clips longer than this many frames are decimated (half the poses,
     /// twice the rate) where record[0] embeds them. Swings and arts keep every
     /// pose: only record[0] has the tight budget.
     pub decimate_over: Option<usize>,
+    /// Stage poses (rows and pool entries) are decimated as well: they are
+    /// parked poses, so half the poses cost little.
+    pub decimate_stage: bool,
 }
 
 fn power_hits(rec: &[u8]) -> usize {
@@ -719,7 +736,9 @@ pub fn plan_boss_with(
         fireball_swing: None,
         up_melee: None,
         stage_rows: Vec::new(),
+        stage_pool: Vec::new(),
         decimate_over: None,
+        decimate_stage: false,
     })
 }
 
@@ -756,7 +775,7 @@ pub fn rebuild_record0(
     rig: &PlayerRig,
     scale: f32,
     up_melee: Option<&[u8]>,
-) -> Result<(Vec<u8>, [usize; 3])> {
+) -> Result<(Vec<u8>, [usize; 3], Vec<usize>)> {
     let d = &rec0.decoded;
     let bank_off = rec0.word(BANK_WORD);
     let bank_end = rec0.word(BANK_PAIR_WORD); // == clut_a - 4 (vestigial pair)
@@ -792,7 +811,8 @@ pub fn rebuild_record0(
             _ if stage.is_some() => {
                 let parts = rec0.stream_shape(0).map(|s| s.0).unwrap_or(0);
                 let (_, ci) = *stage.unwrap();
-                out.extend_from_slice(&stage_entry(slot, &clips[ci], rig, parts, scale));
+                let clip = stage_clip(plan, &clips[ci]);
+                out.extend_from_slice(&stage_entry(slot, &clip, rig, parts, scale));
             }
             Some(&ci) if populated => {
                 let (parts, _) = rec0.stream_shape(slot).unwrap();
@@ -813,6 +833,17 @@ pub fn rebuild_record0(
             }
             _ => out.extend_from_slice(&d[o..end]),
         }
+        while !out.len().is_multiple_of(4) {
+            out.push(0);
+        }
+    }
+    // Pool entries: stage poses nothing in the table points at.
+    let mut pool_offsets = Vec::new();
+    for &ci in &plan.stage_pool {
+        pool_offsets.push(out.len());
+        let parts = rec0.stream_shape(0).map(|s| s.0).unwrap_or(0);
+        let clip = stage_clip(plan, &clips[ci]);
+        out.extend_from_slice(&stage_entry(UP_MELEE_SLOT, &clip, rig, parts, scale));
         while !out.len().is_multiple_of(4) {
             out.push(0);
         }
@@ -859,7 +890,7 @@ pub fn rebuild_record0(
         .copy_from_slice(&((new_clut_a as u32).saturating_sub(4)).to_le_bytes());
     let new_clut_b = (rec0.clut_b as i64 + delta) as usize;
     let budget = out.len();
-    Ok((out, [new_clut_a, new_clut_b, budget]))
+    Ok((out, [new_clut_a, new_clut_b, budget], pool_offsets))
 }
 
 /// Clip + frame count an art record plays.
@@ -1157,6 +1188,8 @@ pub struct Bossized {
     pub worst_member_bytes: usize,
     pub retail_worst_member_bytes: usize,
     pub record0_stream_bytes: usize,
+    /// record[0] offsets of the [`BossPlan::stage_pool`] entries.
+    pub pool_offsets: Vec<usize>,
 }
 
 /// Swing slot (`0xC..=0xF`) a section's `k`th swing record fills.
@@ -1294,7 +1327,8 @@ pub fn bossize_player_file(
     if plan.up_melee.is_some() && up_melee.is_none() {
         bail!("no High swing record found to template the Up melee row");
     }
-    let (new_r0, hdr) = rebuild_record0(&rec0, clips, plan, rig, scale, up_melee.as_deref())?;
+    let (new_r0, hdr, pool_offsets) =
+        rebuild_record0(&rec0, clips, plan, rig, scale, up_melee.as_deref())?;
     let n_records = new_records.len();
     let mut file =
         rebuild_player_file_unbounded(player_file, pack.table_offset, pack.data_base, new_records)?;
@@ -1315,5 +1349,6 @@ pub fn bossize_player_file(
         worst_member_bytes: worst(hdr[0], &max_body, &max_len),
         retail_worst_member_bytes: worst(rec0.clut_a, &old_body, &old_len),
         record0_stream_bytes: stream_bytes,
+        pool_offsets,
     })
 }

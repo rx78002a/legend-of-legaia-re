@@ -87,7 +87,15 @@ pub struct Report {
 
 /// Clip lengths above which a clip is decimated (half the frames, twice the
 /// rate) when the rebuilt player file does not fit; `None` keeps every pose.
-const DECIMATE_CAPS: [Option<usize>; 4] = [None, Some(40), Some(30), Some(22)];
+/// The second field also decimates the stage poses.
+const DECIMATE_CAPS: [(Option<usize>, bool); 6] = [
+    (None, false),
+    (Some(40), false),
+    (Some(30), false),
+    (Some(22), false),
+    (Some(22), true),
+    (Some(16), true),
+];
 
 /// Apply the boss swap to Vahn's slot. Writes through `patcher`.
 ///
@@ -96,12 +104,13 @@ const DECIMATE_CAPS: [Option<usize>; 4] = [None, Some(40), Some(30), Some(22)];
 /// size checks, so a retry starts from the untouched image.
 pub fn apply(patcher: &mut DiscPatcher, opts: &Options) -> Result<Report> {
     let mut last = None;
-    for cap in DECIMATE_CAPS {
-        match apply_with(patcher, opts, cap) {
+    for (cap, stage) in DECIMATE_CAPS {
+        match apply_with(patcher, opts, cap, stage) {
             Ok(mut report) => {
                 if let Some(cap) = cap {
                     report.notes.push(format!(
-                        "record[0] clips longer than {cap} frames decimated (half the poses, twice the rate)"
+                        "record[0] clips longer than {cap} frames decimated (half the poses, twice the rate){}",
+                        if stage { ", stage poses too" } else { "" }
                     ));
                 }
                 return Ok(report);
@@ -125,6 +134,7 @@ fn apply_with(
     patcher: &mut DiscPatcher,
     opts: &Options,
     decimate_over: Option<usize>,
+    decimate_stage: bool,
 ) -> Result<Report> {
     let mut report = Report::default();
     let archive = patcher
@@ -205,19 +215,31 @@ fn apply_with(
     let mut plan = boss::plan_boss_with(&rec0, map, main_n, base_n, fb)?;
     plan.fireball_swing = swing_fireball;
     plan.decimate_over = decimate_over;
+    plan.decimate_stage = decimate_stage;
     if !module_specials.is_empty() {
-        // The modules stage the caster by raw row: author two stage poses from
-        // the boss's own cast clips (the last two tag-0x23 entries).
-        let mut cast: Vec<usize> = (0..clips.len()).filter(|&i| clips[i].tag == 0x23).collect();
-        if cast.is_empty() {
-            cast.push(map_idle(&plan));
+        // The modules stage the caster by raw monster action index; those
+        // exact entries are authored as stage poses. The first stage lives on
+        // row A, the second in a pool the cast prep helper repoints row 6 at.
+        let by_entry = |entry: usize| -> usize {
+            clips
+                .iter()
+                .position(|c| c.entry == entry)
+                .unwrap_or_else(|| map_idle(&plan))
+        };
+        let mut first = None;
+        let mut second_clips = Vec::new();
+        for s in &module_specials {
+            let (one, two) = module_cast::stage_entries(s.spell)
+                .with_context(|| format!("no stage entries for spell {:#04x}", s.spell))?;
+            first.get_or_insert(by_entry(one));
+            second_clips.push(by_entry(two));
         }
-        let a = *cast.last().unwrap();
-        let b = cast.len().checked_sub(2).map(|i| cast[i]).unwrap_or(a);
+        let a = first.context("no cast-module specials")?;
         plan.stage_rows = vec![
             (usize::from(module_cast::STAGE_ROW_A), a),
-            (usize::from(module_cast::STAGE_ROW_B), b),
+            (usize::from(module_cast::STAGE_ROW_B), second_clips[0]),
         ];
+        plan.stage_pool = second_clips;
     }
     if opts.fireball_swing && opts.direct_cast && opts.up_melee {
         plan.up_melee = Some(up_melee_clip);
@@ -338,7 +360,12 @@ fn apply_with(
         ));
     }
     if !module_specials.is_empty() {
-        let fresh = module_cast::install(patcher, &module_specials)?;
+        let pool: Vec<(u8, usize)> = module_specials
+            .iter()
+            .zip(&b.pool_offsets)
+            .map(|(s, &off)| (s.spell, off))
+            .collect();
+        let fresh = module_cast::install(patcher, &module_specials, &pool)?;
         report.notes.push(format!(
             "cast-module route {}",
             if fresh {
