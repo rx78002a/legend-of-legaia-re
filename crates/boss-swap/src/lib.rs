@@ -168,6 +168,9 @@ pub fn apply(patcher: &mut DiscPatcher, opts: &Options) -> Result<Report> {
         (base_slot * winpose::READEF_SLOT) as u64,
         &arch.base,
     )?;
+    if opts.fireball_art.is_some() {
+        route_fireball_move(patcher, opts.monster, &mut report)?;
+    }
     if opts.mute_host_voice {
         mute_vahn_voice(patcher, &mut report)?;
     }
@@ -193,5 +196,43 @@ fn mute_vahn_voice(patcher: &mut DiscPatcher, report: &mut Report) -> Result<()>
             .notes
             .push(format!("{file} channels {channels:?} muted ({n} sectors)"));
     }
+    Ok(())
+}
+
+/// PROT entry of the battle-action overlay and the file offset of its move-id
+/// to move-power-record map (`0x80` bytes, one per move id).
+const BATTLE_OVERLAY_ENTRY: usize = 898;
+const MOVE_POWER_MAP: usize = 0x2664B;
+/// The move id the fireball art's queue starts with: a High swing byte, which
+/// no retail record maps (party arts take no power from the table).
+const FIREBALL_MOVE_ID: usize = 0x0F;
+
+/// Map the fireball art's move id onto the boss's own special-attack record
+/// (the monster's first magic slot), so the clip's terminator installs it and
+/// its launch / contact effects spawn the projectile.
+fn route_fireball_move(patcher: &mut DiscPatcher, monster: u16, report: &mut Report) -> Result<()> {
+    let archive = patcher.read_entry_footprint(MONSTER_ARCHIVE_ENTRY)?;
+    let block = legaia_actor_formats::monster_archive::decode_block(&archive, monster)?
+        .context("empty monster slot")?;
+    let spell = *block.get(0x21).context("monster record too short")? as usize;
+    let overlay = patcher.read_entry(BATTLE_OVERLAY_ENTRY)?;
+    let map = overlay
+        .get(MOVE_POWER_MAP..MOVE_POWER_MAP + 0x80)
+        .context("battle overlay shorter than its move map")?;
+    if spell >= map.len() || map[spell] == 0 {
+        bail!("monster magic id {spell:#x} has no move-power record to borrow");
+    }
+    if map[FIREBALL_MOVE_ID] != 0 {
+        bail!("move id {FIREBALL_MOVE_ID:#x} is already mapped to a power record");
+    }
+    patcher.patch_prot_entry(
+        BATTLE_OVERLAY_ENTRY,
+        (MOVE_POWER_MAP + FIREBALL_MOVE_ID) as u64,
+        &[map[spell]],
+    )?;
+    report.notes.push(format!(
+        "move id {FIREBALL_MOVE_ID:#x} -> move-power record {} (monster magic {spell:#x})",
+        map[spell]
+    ));
     Ok(())
 }
