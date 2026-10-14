@@ -51,7 +51,7 @@ use legaia_code_hooks::arenas::{
     ARENA1_END_VA, ARENA1_VA, ARENA2_END_VA, ARENA2_VA, SCUS_GAP_END_VA, SCUS_GAP_VA,
 };
 use legaia_code_hooks::mips::{
-    self as m, A0, A1, GP, RA, S0, S3, S5, SP, T0, T1, T2, T3, T4, T5, T6, T7, T8, V0, V1, ZERO,
+    self as m, A0, A1, GP, RA, S0, S2, S3, S5, SP, T0, T1, T2, T3, T4, T5, T6, T7, T8, V0, V1, ZERO,
 };
 use legaia_disc_patch::disc::DiscPatcher;
 
@@ -110,7 +110,7 @@ pub fn stage_entries(spell: u8) -> Option<(usize, usize)> {
 #[derive(Debug, Clone, Copy)]
 pub struct Layout {
     /// Sweep scratch: `+0` start seat, `+1` end seat (0 = no victims), `+2`
-    /// `8 - count`, `+4` `0x801D0000 + start * 4`, `+8` `&actor_table[start]`.
+    /// `8 - count`, `+8` `&actor_table[start]`.
     pub scratch: u32,
     /// Constant -> spell table (`0x24` bytes).
     pub table: u32,
@@ -266,9 +266,6 @@ pub fn assemble_prep(l: &Layout) -> Vec<u8> {
     a.op(m::sb(T5, GP, gp_off(1)));
     a.op(m::sb(T7, GP, gp_off(2)));
     a.op(m::sll(T8, T4, 2));
-    a.op(m::lui(T0, 0x801D));
-    a.op(m::addu(T0, T0, T8));
-    a.op(m::sw(T0, GP, gp_off(4))); // 0x801D0000 + start * 4
     a.op(m::lui(T0, m::hi(ACTOR_TABLE_VA)));
     a.op(m::addiu(T0, T0, m::lo(ACTOR_TABLE_VA)));
     a.op(m::addu(T0, T0, T8));
@@ -329,9 +326,12 @@ pub fn edits_936() -> Vec<ModuleEdit> {
     let lui_v0_801d = 0x3C02_801D;
     let move_s3_zero = 0x0000_9821; // addu s3,zero,zero
     let move_a0_zero = 0x0000_2021; // addu a0,zero,zero
+    let addiu_s2_v0 = 0x2452_9370; // addiu s2,v0,-0x6c90
+    let addiu_a1_v0 = 0x2445_9370; // addiu a1,v0,-0x6c90
+    // The R3000 reads the OLD value of a register in the instruction right
+    // after a load: every pointer load below sits two words before its use.
     let start = m::lbu(S3, GP, gp_off(0));
     let end = m::lbu(V0, GP, gp_off(1));
-    let ptr = m::lw(V0, GP, gp_off(4));
     vec![
         // caster stage rows: 0x0D -> row A, 0x0B (Block on a party) -> row B
         ModuleEdit {
@@ -358,7 +358,12 @@ pub fn edits_936() -> Vec<ModuleEdit> {
         ModuleEdit {
             va: 0x801F_7938,
             expect: lui_v0_801d,
-            replace: ptr,
+            replace: m::lw(S2, GP, gp_off(8)),
+        },
+        ModuleEdit {
+            va: 0x801F_793C,
+            expect: addiu_s2_v0,
+            replace: m::nop(),
         },
         ModuleEdit {
             va: 0x801F_7A38,
@@ -379,7 +384,12 @@ pub fn edits_936() -> Vec<ModuleEdit> {
         ModuleEdit {
             va: 0x801F_7B30,
             expect: lui_v0_801d,
-            replace: ptr,
+            replace: m::lw(A1, GP, gp_off(8)),
+        },
+        ModuleEdit {
+            va: 0x801F_7B34,
+            expect: addiu_a1_v0,
+            replace: m::nop(),
         },
         ModuleEdit {
             va: 0x801F_7B70,
@@ -407,12 +417,12 @@ pub fn edits_937() -> Vec<ModuleEdit> {
         ModuleEdit {
             va: 0x801F_6E38,
             expect: 0x0000_2021, // move a0,zero
-            replace: m::lbu(A0, GP, gp_off(2)),
+            replace: m::lw(V1, GP, gp_off(8)),
         },
         ModuleEdit {
             va: 0x801F_6E40,
             expect: 0x00C0_1821, // move v1,a2
-            replace: m::lw(V1, GP, gp_off(8)),
+            replace: m::lbu(A0, GP, gp_off(2)),
         },
         ModuleEdit {
             va: 0x801F_6E5C,
@@ -667,7 +677,6 @@ mod tests {
         let r = prep(0, 2, 0x4B, 42, 180, 3, 2);
         assert_eq!(r.mp(), 42 + 180, "the debit of 180 leaves 42");
         assert_eq!((r.scratch(0), r.scratch(1), r.scratch(2)), (3, 5, 6));
-        assert_eq!(r.word(4), 0x801D_000C);
         assert_eq!(r.word(8), ACTOR_TABLE_VA + 12);
         // row 6 -> pool entry of the spell, its stream pointer rebuilt
         let entry = REC0 + 0x1234;
@@ -685,7 +694,6 @@ mod tests {
         let r = prep(3, 2, 0x4B, 800, 180, 3, 2);
         assert_eq!(r.mp(), 800, "retail debit untouched");
         assert_eq!((r.scratch(0), r.scratch(1), r.scratch(2)), (0, 3, 5));
-        assert_eq!(r.word(4), 0x801D_0000);
         assert_eq!(r.word(8), ACTOR_TABLE_VA);
         assert_eq!(r.cpu.rd32(REC0 + 6 * 4), 0, "no row repoint");
     }
@@ -706,6 +714,19 @@ mod tests {
     fn no_victims_means_end_zero() {
         let r = prep(0, 2, 0x4B, 1, 1, 3, 0);
         assert_eq!((r.scratch(1), r.scratch(2)), (0, 8));
+    }
+
+    fn words(b: &[u8]) -> Vec<u32> {
+        b.chunks(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn no_stub_reads_a_register_in_its_load_delay() {
+        let l = layout();
+        assert!(crate::hazard::load_hazards(&words(&assemble_route(l.table))).is_empty());
+        assert!(crate::hazard::load_hazards(&words(&assemble_prep(&l))).is_empty());
     }
 
     #[test]

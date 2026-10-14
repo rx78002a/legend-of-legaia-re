@@ -6,6 +6,7 @@
 
 pub mod asm;
 pub mod direct_cast;
+pub mod hazard;
 pub mod module_cast;
 pub mod render;
 
@@ -85,7 +86,7 @@ pub struct Report {
     pub notes: Vec<String>,
 }
 
-/// Clip lengths above which a clip is decimated (half the frames, twice the
+/// Clip lengths above which a clip is decimated (half the frames, half the
 /// rate) when the rebuilt player file does not fit; `None` keeps every pose.
 /// The second field also decimates the stage poses.
 const DECIMATE_CAPS: [(Option<usize>, bool); 6] = [
@@ -109,7 +110,7 @@ pub fn apply(patcher: &mut DiscPatcher, opts: &Options) -> Result<Report> {
             Ok(mut report) => {
                 if let Some(cap) = cap {
                     report.notes.push(format!(
-                        "record[0] clips longer than {cap} frames decimated (half the poses, twice the rate){}",
+                        "record[0] clips longer than {cap} frames decimated (half the poses, half the rate){}",
                         if stage { ", stage poses too" } else { "" }
                     ));
                 }
@@ -235,10 +236,9 @@ fn apply_with(
             second_clips.push(by_entry(two));
         }
         let a = first.context("no cast-module specials")?;
-        plan.stage_rows = vec![
-            (usize::from(module_cast::STAGE_ROW_A), a),
-            (usize::from(module_cast::STAGE_ROW_B), second_clips[0]),
-        ];
+        // Row 6 keeps its retail stub: the prep helper repoints its table word
+        // on every routed cast, so no pose of its own is stored.
+        plan.stage_rows = vec![(usize::from(module_cast::STAGE_ROW_A), a)];
         plan.stage_pool = second_clips;
     }
     if opts.fireball_swing && opts.direct_cast && opts.up_melee {

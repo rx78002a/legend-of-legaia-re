@@ -75,8 +75,10 @@ impl BossClip {
         self.frames.is_empty()
     }
 
-    /// The clip at half the frames and twice the rate: same duration, every
-    /// second pose dropped. Every frame-indexed head field moves with it - hit
+    /// The clip at `1/k` of the frames and `1/k` of the rate (the cursor
+    /// advances in proportion to the rate, so the duration holds when the rate
+    /// can halve; a rate of 1 cannot, and that clip plays `k` times faster):
+    /// every second pose dropped. Every frame-indexed head field moves with it - hit
     /// events, effect-script frames, sound cues and the loop window. For a
     /// boss whose long clips overflow the player file's record[0] budget.
     pub fn decimated(&self, k: usize) -> BossClip {
@@ -105,7 +107,10 @@ impl BossClip {
             head[0x85] = scale(head[0x85]);
             head[0x86] = scale(head[0x86]).max(head[0x85].saturating_add(1));
         }
-        head[0x78] = (head[0x78].max(1) as usize * k).min(255) as u8;
+        // The cursor advances in proportion to the rate: with `1/k` of the
+        // poses the same duration needs `1/k` of the rate. A rate of 1 cannot
+        // go lower, so such a clip plays `k` times faster.
+        head[0x78] = (head[0x78].max(1) as usize / k).max(1) as u8;
         BossClip {
             frames,
             head,
@@ -606,7 +611,7 @@ pub struct BossPlan {
     /// [`Bossized::pool_offsets`].
     pub stage_pool: Vec<usize>,
     /// Clips longer than this many frames are decimated (half the poses,
-    /// twice the rate) where record[0] embeds them. Swings and arts keep every
+    /// half the rate) where record[0] embeds them. Swings and arts keep every
     /// pose: only record[0] has the tight budget.
     pub decimate_over: Option<usize>,
     /// Stage poses (rows and pool entries) are decimated as well: they are

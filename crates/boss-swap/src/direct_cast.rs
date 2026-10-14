@@ -375,6 +375,21 @@ mod tests {
     }
 
     #[test]
+    fn no_stub_reads_a_register_in_its_load_delay() {
+        for b in [
+            assemble_begin(table_va(), UP_MELEE_BYTE),
+            assemble_begin(table_va(), 0x0E),
+            assemble_snap(),
+        ] {
+            let w: Vec<u32> = b
+                .chunks(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            assert!(crate::hazard::load_hazards(&w).is_empty());
+        }
+    }
+
+    #[test]
     fn cast_art_collapses_to_the_fireball_swing_in_range() {
         for queue in [
             &[0x0F, 0x0E, 0x19, 0x27, 0][..],

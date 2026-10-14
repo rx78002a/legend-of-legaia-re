@@ -58,15 +58,43 @@ fn check(p: &DiscPatcher) {
     for e in module_cast::edits_937() {
         assert_eq!(word(&m937, e.va), e.replace, "937 {:#x}", e.va);
     }
+    // no edited word reads a register in the delay slot of the load before it
+    for (img, edits) in [
+        (&m936, module_cast::edits_936()),
+        (&m937, module_cast::edits_937()),
+    ] {
+        let ws: Vec<u32> = img
+            .chunks(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        for e in &edits {
+            let i = ((e.va - 0x801F_69D8) / 4) as usize;
+            let lo = i.saturating_sub(1);
+            let hi = (i + 3).min(ws.len());
+            for h in legaia_boss_swap::hazard::load_hazards(&ws[lo..hi]) {
+                // the pair (lo + h, lo + h + 1) must not involve an edited word
+                let at = lo + h;
+                assert!(
+                    !(at == i || at + 1 == i),
+                    "load-delay hazard at {:#x}",
+                    0x801F_69D8 + at as u32 * 4
+                );
+            }
+        }
+    }
     // stage rows authored in record[0], the pool entries behind the table
     let r0 = Record0::parse(&p.read_entry_footprint(863).unwrap()).unwrap();
-    for row in [0x0A, 0x06] {
-        let (parts, frames) = r0.stream_shape(row).expect("row");
-        assert!(parts > 0 && frames > 0, "row {row:#x} authored");
-        let at = r0.entry_offset(row).unwrap();
-        assert_eq!(r0.decoded[at + 0x77], 0x0A, "attach key");
-        assert_eq!(r0.decoded[at + 0x84], 0xFF, "hold window");
-    }
+    // row A holds the first stage pose; row 6 keeps its retail stub (the prep
+    // helper repoints it per cast)
+    let (parts, frames) = r0.stream_shape(0x0A).expect("row A");
+    assert!(parts > 0 && frames > 0, "row 0xa authored");
+    let at = r0.entry_offset(0x0A).unwrap();
+    assert_eq!(r0.decoded[at + 0x77], 0x0A, "attach key");
+    assert_eq!(r0.decoded[at + 0x84], 0xFF, "hold window");
+    assert!(
+        r0.stream_shape(0x06).is_none_or(|(p, f)| p == 0 || f == 0),
+        "row 6 is not authored"
+    );
     for (spell, slot) in [(0x4Bu8, 0usize), (0x4C, 1)] {
         let at = off(l.rows) + slot * 2;
         let entry = u16::from_le_bytes(scus[at..at + 2].try_into().unwrap()) as usize;
