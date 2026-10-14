@@ -209,8 +209,14 @@ fn cort_first_form_routes_guilty_cross() {
     );
     // Mystic Circle rides Hyper Elbow with its one pose in the pool
     assert_eq!(scus[off(l.table) + 0x29 - 0x10], 0xB7);
-    assert_eq!(scus[at + 4], 0xB7, "slot 1 routes Mystic Circle");
-    let pooled = u16::from_le_bytes(scus[at + 6..at + 8].try_into().unwrap()) as usize;
+    assert_eq!(scus[at + 4], 0xAC, "slot 1 routes Mystic Shield");
+    assert_eq!(
+        &scus[at + 6..at + 8],
+        &[0, 0],
+        "the shield has no pooled pose"
+    );
+    assert_eq!(scus[at + 8], 0xB7, "slot 2 routes Mystic Circle");
+    let pooled = u16::from_le_bytes(scus[at + 10..at + 12].try_into().unwrap()) as usize;
     assert!(pooled != 0, "Mystic Circle has a pooled pose");
     // a hit on a monster special requests Cort's readef group (3 * 18)
     assert_eq!(scus[off(l.readef)], 0x36);
@@ -307,4 +313,49 @@ fn dump_patched_modules() {
         )
         .unwrap();
     }
+}
+
+/// Cort's Mystic Shield: the module, finisher and per-frame pass patches land
+/// on the retail words they expect.
+#[test]
+fn cort_first_form_routes_mystic_shield() {
+    let Some(image) = disc() else { return };
+    let mut p = DiscPatcher::open(image).expect("open disc");
+    apply(
+        &mut p,
+        &Options {
+            monster: 180,
+            ..Options::default()
+        },
+    )
+    .expect("apply boss swap");
+    let l = module_cast::layout();
+    let scus = p.read_named_file("SCUS_942.54").unwrap();
+    let off = |va: u32| legaia_game_tables::item_names::file_offset_for_va(&scus, va).unwrap();
+    assert_eq!(scus[off(l.table) + 0x26 - 0x10], 0xAC, "Slash Kick");
+    let routed: Vec<u8> = (0..4).map(|i| scus[off(l.rows) + i * 4]).collect();
+    assert!(routed.contains(&0xAC) && routed.contains(&0xB7) && routed.contains(&0x37));
+    let m940 = p.read_entry(940).unwrap();
+    for e in module_cast::edits_940() {
+        assert_eq!(word(&m940, e.va), e.replace, "940 {:#x}", e.va);
+    }
+    let ov = p.read_entry(898).unwrap();
+    let w = |va: u32| {
+        let at = (va - 0x801C_E818) as usize;
+        u32::from_le_bytes(ov[at..at + 4].try_into().unwrap())
+    };
+    assert_eq!(w(0x801D_DB90), m::j(l.shield_finisher));
+    let pass = word_scus(&scus, off(0x8004_D55C));
+    assert_eq!(pass, m::jal(l.shield_pass));
+    let code = module_cast::assemble_shield_pass(&l);
+    assert_eq!(&scus[off(l.shield_pass)..][..code.len()], code.as_slice());
+    let code = module_cast::assemble_shield_finisher(&l);
+    assert_eq!(
+        &scus[off(l.shield_finisher)..][..code.len()],
+        code.as_slice()
+    );
+}
+
+fn word_scus(scus: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes(scus[off..off + 4].try_into().unwrap())
 }

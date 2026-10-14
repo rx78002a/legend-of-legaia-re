@@ -441,7 +441,10 @@ fn map_idle(plan: &boss::BossPlan) -> usize {
 /// is in its record (the other forms list the rest).
 fn borrowed_spells(monster: u16) -> &'static [u8] {
     match monster {
-        180 => &[module_cast::SPELL_MYSTIC_CIRCLE],
+        180 => &[
+            module_cast::SPELL_MYSTIC_CIRCLE,
+            module_cast::SPELL_MYSTIC_SHIELD,
+        ],
         _ => &[],
     }
 }
@@ -486,12 +489,13 @@ fn module_route(
             .map(|&(constant, spell)| module_cast::Special { constant, spell })
             .collect());
     }
-    // Defaults: the boss's spells, lowest id first, onto Somersault and
-    // Hyper Elbow.
+    // Defaults: each spell on its own art (`module_cast::default_constant`).
     Ok(spells
         .into_iter()
-        .zip([0x27u8, 0x29])
-        .map(|(spell, constant)| module_cast::Special { constant, spell })
+        .filter_map(|spell| {
+            module_cast::default_constant(spell)
+                .map(|constant| module_cast::Special { constant, spell })
+        })
         .collect())
 }
 

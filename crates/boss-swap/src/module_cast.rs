@@ -85,6 +85,19 @@ pub const SPELL_HYPER_LIGHTNING: u8 = 0x4C;
 pub const SPELL_GUILTY_CROSS: u8 = 0x37;
 /// Cort's Mystic Circle (PROT 938, tick body `0x801F69EC`).
 pub const SPELL_MYSTIC_CIRCLE: u8 = 0xB7;
+/// Cort's Mystic Shield (PROT 940, tick body `0x801F7240`).
+pub const SPELL_MYSTIC_SHIELD: u8 = 0xAC;
+
+/// The art each spell is routed onto by default (`--special` overrides):
+/// Somersault, Hyper Elbow and Slash Kick.
+pub fn default_constant(spell: u8) -> Option<u8> {
+    match spell {
+        SPELL_HYPER_CRUSH | SPELL_GUILTY_CROSS => Some(0x27),
+        SPELL_HYPER_LIGHTNING | SPELL_MYSTIC_CIRCLE => Some(0x29),
+        SPELL_MYSTIC_SHIELD => Some(0x26),
+        _ => None,
+    }
+}
 /// The row table holds up to `ROW_SLOTS` routed spells, four bytes each:
 /// `[spell, 0, pool entry offset (u16)]`, an empty slot has spell `0`.
 pub const ROW_SLOTS: usize = 4;
@@ -119,6 +132,8 @@ pub fn stage_entries(spell: u8) -> Option<StageEntries> {
         SPELL_HYPER_LIGHTNING => (Some(0x0D), Some(0x0C)),
         SPELL_GUILTY_CROSS => (Some(0x08), None),
         SPELL_MYSTIC_CIRCLE => (None, Some(0x07)),
+        // the shield body stages no caster pose: the caster holds its idle
+        SPELL_MYSTIC_SHIELD => (None, None),
         _ => return None,
     };
     Some(StageEntries { row_a, pooled })
@@ -143,6 +158,14 @@ pub struct Layout {
     pub readef: u32,
     /// The texture request routine.
     pub hook: u32,
+    /// Mystic Shield: the damage finisher's side check, the effect-handle
+    /// store, the caster-seat loader and the per-frame pass's seat loader.
+    pub shield_finisher: u32,
+    pub shield_store: u32,
+    pub shield_caster: u32,
+    pub shield_pass: u32,
+    /// The shield owner's seat (one byte; ARENA2).
+    pub owner: u32,
 }
 
 pub fn layout() -> Layout {
@@ -153,6 +176,11 @@ pub fn layout() -> Layout {
         prep: ARENA1_VA,
         readef: ARENA2_VA + 0x44,
         hook: HOOK_VA,
+        shield_finisher: HOOK_VA + 0x80,
+        shield_store: HOOK_VA + 0x100,
+        shield_caster: HOOK_VA + 0x120,
+        shield_pass: HOOK_VA + 0x150,
+        owner: ARENA2_VA + 0x45,
     }
 }
 
@@ -397,6 +425,124 @@ pub fn assemble_readef_request(l: &Layout) -> Vec<u8> {
     words_to_bytes(a.finish())
 }
 
+/// Where Mystic Shield's retail code is patched.
+const SHIELD_FINISHER_SITE_VA: u32 = 0x801D_DB90; // bnez v1,0x801DDBCC
+const SHIELD_FINISHER_PARTY_VA: u32 = 0x801D_DBCC;
+const SHIELD_FINISHER_DONE_VA: u32 = 0x801D_E094;
+const SHIELD_PASS_SITE_VA: u32 = 0x8004_D55C; // lw v0,0xc(a1)
+const SHIELD_STORE_VA: u32 = 0x801F_7678; // sw v0,-0x427c(v1)
+const SHIELD_CASTER_VA: u32 = 0x801F_7648; // lui s0,0x801d
+/// The shield's handle word (`-0x427C` from `0x80080000`).
+const SHIELD_HANDLE_OFF: u16 = 0xBD84;
+
+fn owner_off(l: &Layout) -> u16 {
+    (l.owner as i64 - GP_VA as i64) as i16 as u16
+}
+
+/// `FUN_801DDB30`, the damage finisher, halves every hit on an **enemy**
+/// defender while the shield's handle word is live. The shield belongs to
+/// whoever cast it, so the host's shield halves hits on the party instead:
+/// the defender's side must equal the owner's side. Entered through a `j`
+/// that replaces `bnez v1,<party path>` (`v1` = defender is a party seat;
+/// its delay slot `sltiu v0,a2,3` is the original and stays).
+pub fn assemble_shield_finisher(l: &Layout) -> Vec<u8> {
+    let mut a = Asm::new();
+    let (plain, party) = (a.label(), a.label());
+    a.op(m::lui(T0, 0x8008));
+    a.op(m::lw(T0, T0, SHIELD_HANDLE_OFF)); // the shield's handle
+    a.op(m::lbu(T1, GP, owner_off(l))); // the owner's seat
+    a.op(m::nop());
+    a.br(plain, move |o| m::beq(T0, ZERO, o)); // no shield up
+    a.op(m::sltiu(T1, T1, 3)); // delay: owner is a party seat
+    a.br(plain, move |o| m::bne(V1, T1, o)); // the other side's shield
+    a.op(m::nop());
+    a.op(m::lw(T2, S0, 0)); // damage
+    a.op(m::lw(T3, S2, 0)); // its floor
+    a.op(m::nop());
+    a.op(m::subu(T2, T2, T3));
+    a.op(m::srl(T2, T2, 1));
+    a.op(m::addu(T3, T3, T2));
+    a.op(m::sw(T3, S0, 0));
+    a.bind(plain);
+    a.br(party, move |o| m::bne(V1, ZERO, o)); // a party defender: its own path
+    a.op(m::nop());
+    a.op(m::j(SHIELD_FINISHER_DONE_VA)); // an enemy defender: nothing more
+    a.op(m::nop());
+    a.bind(party);
+    a.op(m::j(SHIELD_FINISHER_PARTY_VA));
+    a.op(m::nop());
+    words_to_bytes(a.finish())
+}
+
+/// Stores the shield's effect handle (`v0`) and the caster's seat as its owner;
+/// entered by a `jal` at the module's `sw v0,-0x427c(v1)` (`v1` = `0x80080000`,
+/// the delay slot is the next original word).
+pub fn assemble_shield_store(l: &Layout) -> Vec<u8> {
+    let mut a = Asm::new();
+    a.op(m::sw(V0, V1, SHIELD_HANDLE_OFF));
+    a.op(m::lw(T0, V1, 0xBD24)); // ctx
+    a.op(m::nop());
+    a.op(m::lbu(T0, T0, 0x13)); // caster seat
+    a.op(m::nop());
+    a.op(m::sb(T0, GP, owner_off(l)));
+    a.op(m::jr(RA));
+    a.op(m::nop());
+    words_to_bytes(a.finish())
+}
+
+/// The module's `lui s0,0x801d` (+ `addiu s0,s0,-0x6c90`) made `s0` the actor
+/// table so the following `0xC(s0)` reads seat 3, the first monster. This makes
+/// `s0` the table cell *before* the caster's, so those reads hit the caster.
+pub fn assemble_shield_caster() -> Vec<u8> {
+    let mut a = Asm::new();
+    a.op(m::lui(T0, 0x8008));
+    a.op(m::lw(T0, T0, 0xBD24)); // ctx
+    a.op(m::lui(S0, 0x801D));
+    a.op(m::lbu(T0, T0, 0x13)); // caster seat
+    a.op(m::addiu(S0, S0, m::lo(ACTOR_TABLE_VA - 0xC)));
+    a.op(m::sll(T0, T0, 2));
+    a.op(m::addu(S0, S0, T0));
+    a.op(m::jr(RA));
+    a.op(m::nop());
+    words_to_bytes(a.finish())
+}
+
+/// The per-frame pass that keeps the shield on its owner (`FUN_8004CE2C`,
+/// SCUS) reads the owner as seat 3 through `a1` = actor table. Entered by a
+/// `jal` that replaces its first `lw v0,0xC(a1)` (the delay slot is the `nop`
+/// after it): `a1` becomes the cell before the owner's, so every `0xC(a1)` of
+/// the pass hits the owner, whose half-HP test then breaks the shield.
+pub fn assemble_shield_pass(l: &Layout) -> Vec<u8> {
+    let mut a = Asm::new();
+    a.op(m::lbu(T1, GP, owner_off(l)));
+    a.op(m::lui(T2, m::hi(ACTOR_TABLE_VA - 0xC)));
+    a.op(m::addiu(T2, T2, m::lo(ACTOR_TABLE_VA - 0xC)));
+    a.op(m::sll(T1, T1, 2));
+    a.op(m::addu(A1, T2, T1));
+    a.op(m::lw(V0, A1, 0xC));
+    a.op(m::jr(RA));
+    a.op(m::nop());
+    words_to_bytes(a.finish())
+}
+
+/// PROT 940's Mystic Shield body: the shield effect and the blanked reaction
+/// run follow the caster instead of seat 3, and the owner is recorded.
+pub fn edits_940() -> Vec<ModuleEdit> {
+    let l = layout();
+    vec![
+        ModuleEdit {
+            va: SHIELD_CASTER_VA,
+            expect: m::lui(S0, 0x801D),
+            replace: m::jal(l.shield_caster),
+        },
+        ModuleEdit {
+            va: SHIELD_STORE_VA,
+            expect: m::sw(V0, V1, SHIELD_HANDLE_OFF),
+            replace: m::jal(l.shield_store),
+        },
+    ]
+}
+
 /// One expect-verified word edit inside a module image.
 #[derive(Debug, Clone, Copy)]
 pub struct ModuleEdit {
@@ -599,6 +745,7 @@ pub fn module_for(spell: u8) -> Option<(usize, Vec<ModuleEdit>)> {
         SPELL_HYPER_LIGHTNING => Some((937, edits_937())),
         SPELL_GUILTY_CROSS => Some((944, edits_944())),
         SPELL_MYSTIC_CIRCLE => Some((938, edits_938())),
+        SPELL_MYSTIC_SHIELD => Some((940, edits_940())),
         _ => None,
     }
 }
@@ -657,6 +804,44 @@ fn write_scus(patcher: &mut DiscPatcher, va: u32, bytes: &[u8]) -> Result<bool> 
     Ok(true)
 }
 
+/// Replace one word of the battle overlay (PROT 898), verifying the retail one.
+fn patch_overlay_word(
+    patcher: &mut DiscPatcher,
+    va: u32,
+    expect: u32,
+    replace: u32,
+) -> Result<bool> {
+    let entry = patcher.read_entry(898)?;
+    let at = (va - 0x801C_E818) as usize;
+    let word = u32::from_le_bytes(entry[at..at + 4].try_into()?);
+    if word == replace {
+        return Ok(false);
+    }
+    if word != expect {
+        bail!("overlay {va:#010x}: expected {expect:#010x}, found {word:#010x}");
+    }
+    patcher.patch_prot_entry(898, at as u64, &replace.to_le_bytes())?;
+    Ok(true)
+}
+
+/// Replace one word of `SCUS_942.54`, verifying the retail one.
+fn patch_scus_word(patcher: &mut DiscPatcher, va: u32, expect: u32, replace: u32) -> Result<bool> {
+    let scus = patcher
+        .read_named_file(SCUS_NAME)
+        .context("read SCUS_942.54")?;
+    let off = legaia_game_tables::item_names::file_offset_for_va(&scus, va)
+        .with_context(|| format!("resolve the file offset of {va:#010x}"))?;
+    let word = u32::from_le_bytes(scus[off..off + 4].try_into()?);
+    if word == replace {
+        return Ok(false);
+    }
+    if word != expect {
+        bail!("SCUS {va:#010x}: expected {expect:#010x}, found {word:#010x}");
+    }
+    patcher.patch_named_file(SCUS_NAME, off as u64, &replace.to_le_bytes())?;
+    Ok(true)
+}
+
 /// Patch the debit site of state `0x28` in the battle overlay.
 fn redirect_debit(patcher: &mut DiscPatcher, prep_va: u32) -> Result<bool> {
     let entry = patcher.read_entry(898)?;
@@ -697,7 +882,10 @@ pub fn install(
     if l.prep + prep.len() as u32 > ARENA1_END_VA {
         bail!("module-cast prep helper does not fit ARENA1");
     }
-    if l.readef + 1 > ARENA2_END_VA || l.rows + (ROW_SLOTS * 4) as u32 > l.readef {
+    if l.owner + 1 > ARENA2_END_VA
+        || l.readef + 1 > ARENA2_END_VA
+        || l.rows + (ROW_SLOTS * 4) as u32 > l.readef
+    {
         bail!("module-cast tables do not fit ARENA2");
     }
     let mut changed = false;
@@ -713,6 +901,31 @@ pub fn install(
         }
         changed |= write_scus(patcher, l.hook, &hook)?;
         changed |= write_scus(patcher, l.readef, &[readef_base])?;
+    }
+    if specials.iter().any(|s| s.spell == SPELL_MYSTIC_SHIELD) {
+        for (va, code) in [
+            (l.shield_finisher, assemble_shield_finisher(&l)),
+            (l.shield_store, assemble_shield_store(&l)),
+            (l.shield_caster, assemble_shield_caster()),
+            (l.shield_pass, assemble_shield_pass(&l)),
+        ] {
+            if va + code.len() as u32 > HOOK_END_VA {
+                bail!("a shield routine does not fit its gap");
+            }
+            changed |= write_scus(patcher, va, &code)?;
+        }
+        changed |= patch_overlay_word(
+            patcher,
+            SHIELD_FINISHER_SITE_VA,
+            m::bne(V1, ZERO, 14),
+            m::j(l.shield_finisher),
+        )?;
+        changed |= patch_scus_word(
+            patcher,
+            SHIELD_PASS_SITE_VA,
+            m::lw(V0, A1, 0xC),
+            m::jal(l.shield_pass),
+        )?;
     }
     changed |= legaia_delilas_party::delilas_cast::redirect_applier_call(patcher, SCUS_GAP_VA)?;
     changed |= legaia_delilas_party::delilas_cast::install_cast_label_gate(patcher)?;
@@ -932,6 +1145,101 @@ mod tests {
         assert_eq!(readef_request(0xB7, 0, 0), (0, 0), "no group configured");
     }
 
+    /// Run the shield finisher hook. Returns `(damage, where it left)`.
+    fn finisher(defender_party: bool, owner_seat: u8, shield: bool) -> (u32, u32) {
+        let mut cpu = Cpu::new();
+        let l = layout();
+        cpu.load(l.shield_finisher, &assemble_shield_finisher(&l));
+        cpu.wr32(0x8007_BD84, u32::from(shield) * 0x1234);
+        cpu.wr8(l.owner, owner_seat);
+        cpu.wr32(0x8010_0000, 100); // damage
+        cpu.wr32(0x8010_0010, 20); // floor
+        cpu.r[S0 as usize] = 0x8010_0000;
+        cpu.r[S2 as usize] = 0x8010_0010;
+        cpu.r[V1 as usize] = u32::from(defender_party);
+        cpu.r[GP as usize] = GP_VA;
+        cpu.pc = l.shield_finisher;
+        let at = cpu.run_until(&[SHIELD_FINISHER_PARTY_VA, SHIELD_FINISHER_DONE_VA]);
+        (cpu.rd32(0x8010_0000), at)
+    }
+
+    #[test]
+    fn a_hosts_shield_halves_hits_on_the_party() {
+        // party owner: a party defender is halved (excess over the floor)
+        assert_eq!(finisher(true, 0, true), (60, SHIELD_FINISHER_PARTY_VA));
+        // ... and an enemy defender is not
+        assert_eq!(finisher(false, 0, true), (100, SHIELD_FINISHER_DONE_VA));
+    }
+
+    #[test]
+    fn a_monsters_shield_keeps_its_retail_side() {
+        assert_eq!(finisher(false, 3, true), (60, SHIELD_FINISHER_DONE_VA));
+        assert_eq!(finisher(true, 3, true), (100, SHIELD_FINISHER_PARTY_VA));
+    }
+
+    #[test]
+    fn no_shield_no_halving() {
+        assert_eq!(finisher(true, 0, false), (100, SHIELD_FINISHER_PARTY_VA));
+        assert_eq!(finisher(false, 3, false), (100, SHIELD_FINISHER_DONE_VA));
+    }
+
+    #[test]
+    fn the_shield_store_records_handle_and_owner() {
+        let mut cpu = Cpu::new();
+        let l = layout();
+        cpu.load(l.shield_store, &assemble_shield_store(&l));
+        cpu.wr32(CTX_PTR_VA, CTX);
+        cpu.wr8(CTX + 0x13, 2);
+        cpu.r[V0 as usize] = 0xABCD;
+        cpu.r[V1 as usize] = 0x8008_0000;
+        cpu.r[GP as usize] = GP_VA;
+        cpu.r[RA as usize] = RETURN_VA;
+        cpu.pc = l.shield_store;
+        cpu.run_until(&[RETURN_VA]);
+        assert_eq!(cpu.rd32(0x8007_BD84), 0xABCD);
+        assert_eq!(cpu.rd8(l.owner), 2);
+    }
+
+    #[test]
+    fn the_shield_follows_the_caster_not_seat_three() {
+        let mut cpu = Cpu::new();
+        cpu.load(layout().shield_caster, &assemble_shield_caster());
+        cpu.wr32(CTX_PTR_VA, CTX);
+        cpu.wr8(CTX + 0x13, 1);
+        cpu.r[RA as usize] = RETURN_VA;
+        cpu.pc = layout().shield_caster;
+        cpu.run_until(&[RETURN_VA]);
+        // 0xC(s0) is the caster's table cell
+        assert_eq!(cpu.r[S0 as usize] + 0xC, ACTOR_TABLE_VA + 4);
+        // a monster caster at seat 3 keeps retail's `0xC(table)`
+        cpu.wr8(CTX + 0x13, 3);
+        cpu.r[RA as usize] = RETURN_VA;
+        cpu.pc = layout().shield_caster;
+        cpu.run_until(&[RETURN_VA]);
+        assert_eq!(cpu.r[S0 as usize] + 0xC, ACTOR_TABLE_VA + 12);
+    }
+
+    #[test]
+    fn the_per_frame_pass_reads_the_owner() {
+        let mut cpu = Cpu::new();
+        let l = layout();
+        cpu.load(l.shield_pass, &assemble_shield_pass(&l));
+        cpu.wr8(l.owner, 0);
+        cpu.wr32(ACTOR_TABLE_VA, 0x8012_3456);
+        cpu.wr32(ACTOR_TABLE_VA + 12, 0x8012_9999);
+        cpu.r[GP as usize] = GP_VA;
+        cpu.r[RA as usize] = RETURN_VA;
+        cpu.pc = l.shield_pass;
+        cpu.run_until(&[RETURN_VA]);
+        assert_eq!(cpu.r[V0 as usize], 0x8012_3456);
+        assert_eq!(cpu.r[A1 as usize] + 0xC, ACTOR_TABLE_VA);
+        cpu.wr8(l.owner, 3);
+        cpu.r[RA as usize] = RETURN_VA;
+        cpu.pc = l.shield_pass;
+        cpu.run_until(&[RETURN_VA]);
+        assert_eq!(cpu.r[V0 as usize], 0x8012_9999);
+    }
+
     fn words(b: &[u8]) -> Vec<u32> {
         b.chunks(4)
             .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
@@ -944,6 +1252,14 @@ mod tests {
         assert!(crate::hazard::load_hazards(&words(&assemble_route(l.table, None))).is_empty());
         assert!(crate::hazard::load_hazards(&words(&assemble_prep(&l))).is_empty());
         assert!(crate::hazard::load_hazards(&words(&assemble_readef_request(&l))).is_empty());
+        for code in [
+            assemble_shield_finisher(&l),
+            assemble_shield_store(&l),
+            assemble_shield_caster(),
+            assemble_shield_pass(&l),
+        ] {
+            assert!(crate::hazard::load_hazards(&words(&code)).is_empty());
+        }
     }
 
     #[test]
@@ -951,7 +1267,20 @@ mod tests {
         let l = layout();
         assert!(l.prep as usize + assemble_prep(&l).len() <= ARENA1_END_VA as usize);
         assert!(l.rows as usize + ROW_SLOTS * 4 <= l.readef as usize);
-        assert!(l.readef < ARENA2_END_VA);
+        assert!(l.readef < ARENA2_END_VA && l.owner < ARENA2_END_VA);
+        for (va, code) in [
+            (l.shield_finisher, assemble_shield_finisher(&l)),
+            (l.shield_store, assemble_shield_store(&l)),
+            (l.shield_caster, assemble_shield_caster()),
+            (l.shield_pass, assemble_shield_pass(&l)),
+        ] {
+            assert!((va + code.len() as u32) <= HOOK_END_VA);
+        }
+        // the routines do not overlap
+        assert!(l.hook + assemble_readef_request(&l).len() as u32 <= l.shield_finisher);
+        assert!(l.shield_finisher + assemble_shield_finisher(&l).len() as u32 <= l.shield_store);
+        assert!(l.shield_store + assemble_shield_store(&l).len() as u32 <= l.shield_caster);
+        assert!(l.shield_caster + assemble_shield_caster().len() as u32 <= l.shield_pass);
         assert!(l.hook as usize + assemble_readef_request(&l).len() <= HOOK_END_VA as usize);
         assert!(
             SCUS_GAP_VA as usize + assemble_route(l.table, Some(l.hook)).len()
