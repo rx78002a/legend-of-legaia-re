@@ -419,8 +419,18 @@ pub fn stage_entry(
     e[0] = row as u8;
     e[0x77] = UP_MELEE_SLOT as u8;
     e[0x78] = clip.head[0x78].max(1);
-    let park = n.saturating_sub(2);
-    set_loop(&mut e, 0xFF, park, park);
+    // The clip's own hold window: retail casts park on the pose the move
+    // is about to release (Crush's fist on the ground, not the recovery
+    // after it). A clip without one parks near its end.
+    let (cnt, hs, he) = (clip.head[0x84], clip.head[0x85], clip.head[0x86]);
+    if cnt != 0 && (hs as usize) < n {
+        let hs = hs as usize;
+        let he = (he as usize).clamp(hs, n.saturating_sub(1));
+        set_loop(&mut e, cnt, hs, he);
+    } else {
+        let park = n.saturating_sub(2);
+        set_loop(&mut e, 0xFF, park, park);
+    }
     e.extend_from_slice(&player_stream(&clip.frames, rig, parts, scale));
     e
 }
