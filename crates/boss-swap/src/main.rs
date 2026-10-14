@@ -5,7 +5,7 @@ use legaia_disc_patch::ppf;
 
 fn usage() -> ! {
     eprintln!(
-        "usage: boss-swap build <disc.bin|.cue> <out.ppf> [--monster N] [--scale F]\n       \
+        "usage: boss-swap build <disc.bin|.cue> <out.ppf> [--monster N] [--scale F] [--classic] [--keep-voices]\n       \
          (writes a PPF 3.0 patch; the disc image is never modified)"
     );
     std::process::exit(2);
@@ -35,6 +35,14 @@ fn main() -> Result<()> {
             "--scale" => {
                 opts.scale = args.get(i + 1).context("--scale F")?.parse()?;
                 i += 2;
+            }
+            "--classic" => {
+                opts.fireball = false;
+                i += 1;
+            }
+            "--keep-voices" => {
+                opts.mute_host_voice = false;
+                i += 1;
             }
             other => bail!("unknown argument {other}"),
         }
@@ -99,6 +107,14 @@ fn render(args: &[String]) -> Result<()> {
             "--cell" => {
                 cell = args[i + 1].parse()?;
                 i += 2;
+            }
+            "--classic" => {
+                opts.fireball = false;
+                i += 1;
+            }
+            "--keep-voices" => {
+                opts.mute_host_voice = false;
+                i += 1;
             }
             "--retail" => {
                 retail = true;

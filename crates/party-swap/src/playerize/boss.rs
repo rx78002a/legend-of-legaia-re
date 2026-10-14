@@ -267,6 +267,9 @@ pub struct ClipMap {
     /// Victory source and the idle it settles into.
     pub victory: usize,
     pub idle: usize,
+    /// Fireball mode: every swing and art plays this one clip (the boss's
+    /// cast, retimed to release on its first hit event).
+    pub fireball: Option<usize>,
 }
 
 fn find_tag(clips: &[BossClip], tag: u8) -> Option<usize> {
@@ -320,7 +323,62 @@ pub fn default_clip_map(clips: &[BossClip]) -> Result<ClipMap> {
         walk,
         victory,
         idle,
+        fireball: None,
     })
+}
+
+/// Frames of the Spirit-charge hold stream (main ME entry 0 is addressed up
+/// to row 58).
+const CHARGE_FRAMES: usize = 59;
+/// Frames between consecutive hits of a multi-hit art in fireball mode.
+const FIREBALL_HIT_GAP: usize = 2;
+/// `[count, start, end]` hold window the boss's own cast uses to charge.
+const FIREBALL_LOOP: (u8, usize, usize) = (10, 10, 11);
+
+/// Append the two fireball clips to `clips` and return the map in which every
+/// swing and art plays them: the boss's cast clip (tag `0x23`) with its
+/// move-power terminator record dropped (a party actor has no monster move
+/// power to install) and one hit event on the frame that record sat on, and a
+/// copy padded to the Spirit-charge length for main ME entry 0.
+pub fn fireball_map(clips: &mut Vec<BossClip>) -> Result<ClipMap> {
+    let mut map = default_clip_map(clips)?;
+    let cast = find_tag(clips, 0x23).context("boss has no tag 0x23 cast clip")?;
+    let mut play = clips[cast].clone();
+    let mut release = None;
+    for r in 0..8 {
+        let o = 0x14 + r * 8;
+        if play.head[o] != 0 && play.head[o + 1] & 0x7F == 0x7F {
+            release = Some(play.head[o]);
+            play.head[o..o + 8].fill(0);
+        }
+    }
+    let release = release.unwrap_or((play.len() as u8).saturating_sub(9).max(1));
+    play.head[0x10..0x14].copy_from_slice(&[release, 0, 0, 0]);
+    play.head[0x78] = play.head[0x78].max(2);
+    let mut charge = play.clone();
+    while charge.frames.len() < CHARGE_FRAMES {
+        let last = charge.frames.last().cloned().unwrap_or_default();
+        charge.frames.push(last);
+    }
+    let (a, p) = (clips.len(), clips.len() + 1);
+    clips.push(play);
+    clips.push(charge);
+    map.swings = [a; 4];
+    map.single_hit = vec![a; 4];
+    map.multi_hit = p;
+    map.fireball = Some(a);
+    Ok(map)
+}
+
+/// Fireball timing for an art record entry: `hits` beats from the release
+/// frame, and the boss's charge hold.
+fn fireball_timing(entry: &mut [u8], clip: &BossClip, hits: usize, n: usize) {
+    let first = clip.events().first().copied().unwrap_or(1) as usize;
+    entry[0x10..0x14].fill(0);
+    for i in 0..hits.min(4) {
+        entry[0x10 + i] = (first + i * FIREBALL_HIT_GAP).min(n.saturating_sub(1)) as u8;
+    }
+    set_loop(entry, FIREBALL_LOOP.0, FIREBALL_LOOP.1, FIREBALL_LOOP.2);
 }
 
 // ---------------------------------------------------------------------------
@@ -418,7 +476,16 @@ pub fn plan_boss(
     main_entries: usize,
     base_entries: usize,
 ) -> Result<BossPlan> {
-    let map = default_clip_map(clips)?;
+    plan_boss_with(rec0, default_clip_map(clips)?, main_entries, base_entries)
+}
+
+/// [`plan_boss`] over an explicit clip map (see [`fireball_map`]).
+pub fn plan_boss_with(
+    rec0: &Record0,
+    map: ClipMap,
+    main_entries: usize,
+    base_entries: usize,
+) -> Result<BossPlan> {
     let bank_off = rec0.word(BANK_WORD);
     let count = rec0.word(bank_off);
     if count == 0 || count > 0x40 {
@@ -454,7 +521,11 @@ pub fn plan_boss(
     main[5] = MainEntry::Clip(map.walk);
     let mut single_i = 0usize;
     for a in arts.iter_mut().filter(|a| !a.base) {
-        a.new_source = if a.stream_source == 0 {
+        a.new_source = if map.fireball.is_some() && a.hits > 0 {
+            // Entry 0 is the padded charge stream; arts play the real clip.
+            single_i += 1;
+            1 + (single_i - 1) % 4
+        } else if a.stream_source == 0 {
             0
         } else if a.hits == 0 {
             5
@@ -571,6 +642,9 @@ pub fn rebuild_record0(
         } else {
             apply_clip_head(entry, clip, n, Kind::Attack);
             clamp_loop(entry, n);
+            if plan.map.fireball.is_some() && a.hits > 0 {
+                fireball_timing(entry, clip, a.hits, n);
+            }
         }
     }
     let pad = &d[old_bank_end..rec0.clut_a];
@@ -865,11 +939,20 @@ pub fn boss_geometry(
 // The whole player file
 
 /// Replacement for the swing record `old` (head + stream) playing `clip`.
-fn swing_entry(old: &[u8], clip: &BossClip, rig: &PlayerRig, scale: f32) -> Vec<u8> {
+fn swing_entry(
+    old: &[u8],
+    clip: &BossClip,
+    rig: &PlayerRig,
+    scale: f32,
+    fireball: bool,
+) -> Vec<u8> {
     let parts = old[PLAYER_HEAD] as usize;
     let mut e = old[..PLAYER_HEAD].to_vec();
     apply_clip_head(&mut e, clip, clip.len(), Kind::Attack);
     clamp_loop(&mut e, clip.len());
+    if fireball {
+        fireball_timing(&mut e, clip, 1, clip.len());
+    }
     e.extend_from_slice(&player_stream(&clip.frames, rig, parts, scale));
     e
 }
@@ -986,6 +1069,7 @@ pub fn bossize_player_file(
                 &clips[plan.map.swings[slot - 0xC]],
                 rig,
                 scale,
+                plan.map.fireball.is_some(),
             ))
         })
         .with_context(|| format!("swap swing records of record {idx}"))?;

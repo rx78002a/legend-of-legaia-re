@@ -25,13 +25,21 @@ pub struct Options {
     pub monster: u16,
     /// Uniform scale applied to the boss geometry and pose translations.
     pub scale: f32,
+    /// Every swing and art plays the boss's cast (its fireball), not the
+    /// boss's melee moves.
+    pub fireball: bool,
+    /// Mute the host character's own voice banks (arts shout, fanfares,
+    /// swing grunt, victory barks).
+    pub mute_host_voice: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
         Self {
             monster: 76,
-            scale: 1.0,
+            scale: 0.8,
+            fireball: true,
+            mute_host_voice: true,
         }
     }
 }
@@ -67,9 +75,14 @@ pub fn apply(patcher: &mut DiscPatcher, opts: &Options) -> Result<Report> {
     let main_n = me_archive::parse(slot_bytes(main_slot)?)?.len();
     let base_n = me_archive::parse(slot_bytes(base_slot)?)?.len();
 
-    let clips = boss::boss_clips(&archive, opts.monster)?;
+    let mut clips = boss::boss_clips(&archive, opts.monster)?;
     let rec0 = boss::Record0::parse(&player)?;
-    let plan = boss::plan_boss(&rec0, &clips, main_n, base_n)?;
+    let plan = if opts.fireball {
+        let map = boss::fireball_map(&mut clips)?;
+        boss::plan_boss_with(&rec0, map, main_n, base_n)?
+    } else {
+        boss::plan_boss(&rec0, &clips, main_n, base_n)?
+    };
     report.notes.push(format!(
         "boss #{}: {} clips; art records: {}, main ME entries: {main_n}, base: {base_n}",
         opts.monster,
@@ -154,5 +167,30 @@ pub fn apply(patcher: &mut DiscPatcher, opts: &Options) -> Result<Report> {
         (base_slot * winpose::READEF_SLOT) as u64,
         &arch.base,
     )?;
+    if opts.mute_host_voice {
+        mute_vahn_voice(patcher, &mut report)?;
+    }
     Ok(report)
+}
+
+/// Vahn's voice lives in CD-XA files, not in the battle file: the arts shout
+/// bank, the Hyper / Super fanfare and Seru-magic fanfare banks, the swing
+/// grunt channel of the shared grunt bank and the victory-bark channels.
+/// Each cue still fires; the sectors decode to silence.
+fn mute_vahn_voice(patcher: &mut DiscPatcher, report: &mut Report) -> Result<()> {
+    for file in ["XA/XA1.XA", "XA/XA2.XA", "XA/XA27.XA"] {
+        let n = patcher
+            .silence_xa_file(file)
+            .with_context(|| format!("mute {file}"))?;
+        report.notes.push(format!("{file} muted ({n} sectors)"));
+    }
+    for (file, channels) in [("XA/XA30.XA", &[0u8][..]), ("XA/XA21.XA", &[2, 3][..])] {
+        let n = patcher
+            .silence_xa_channels(file, channels)
+            .with_context(|| format!("mute {file} channels {channels:?}"))?;
+        report
+            .notes
+            .push(format!("{file} channels {channels:?} muted ({n} sectors)"));
+    }
+    Ok(())
 }
