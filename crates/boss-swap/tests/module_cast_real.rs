@@ -43,7 +43,7 @@ fn check(p: &DiscPatcher) {
     // stub, helper and tables in SCUS
     let scus = p.read_named_file("SCUS_942.54").unwrap();
     let off = |va: u32| legaia_game_tables::item_names::file_offset_for_va(&scus, va).unwrap();
-    let route = module_cast::assemble_route(l.table);
+    let route = module_cast::assemble_route(l.table, None);
     assert_eq!(&scus[off(SCUS_GAP_VA)..][..route.len()], route.as_slice());
     let prep = module_cast::assemble_prep(&l);
     assert_eq!(&scus[off(l.prep)..][..prep.len()], prep.as_slice());
@@ -212,15 +212,11 @@ fn cort_first_form_routes_guilty_cross() {
     assert_eq!(scus[at + 4], 0xB7, "slot 1 routes Mystic Circle");
     let pooled = u16::from_le_bytes(scus[at + 6..at + 8].try_into().unwrap()) as usize;
     assert!(pooled != 0, "Mystic Circle has a pooled pose");
-    // the turn scheduler streams Cort's readef group (3 * 18) for the special
+    // a hit on a monster special requests Cort's readef group (3 * 18)
     assert_eq!(scus[off(l.readef)], 0x36);
-    let ov = p.read_entry(898).unwrap();
-    let hook_at = (0x801D_B0F0u32 - 0x801C_E818) as usize;
-    assert_eq!(
-        u32::from_le_bytes(ov[hook_at..hook_at + 4].try_into().unwrap()),
-        legaia_code_hooks::mips::jal(l.hook)
-    );
-    let hook = module_cast::assemble_readef_hook(&l);
+    let route = module_cast::assemble_route(l.table, Some(l.hook));
+    assert_eq!(&scus[off(SCUS_GAP_VA)..][..route.len()], route.as_slice());
+    let hook = module_cast::assemble_readef_request(&l);
     assert_eq!(&scus[off(l.hook)..][..hook.len()], hook.as_slice());
     let m938 = p.read_entry(938).unwrap();
     let edits = module_cast::edits_938();

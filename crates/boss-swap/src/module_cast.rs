@@ -138,10 +138,10 @@ pub struct Layout {
     pub rows: u32,
     /// The cast prep helper.
     pub prep: u32,
-    /// The readef group base the turn scheduler hook streams for a routed
-    /// cast (one byte, `0` = none).
+    /// The readef group base streamed for a routed monster special (one
+    /// byte, `0` = none).
     pub readef: u32,
-    /// The turn scheduler hook.
+    /// The texture request routine.
     pub hook: u32,
 }
 
@@ -162,15 +162,11 @@ fn gp_off(k: u32) -> u16 {
     ((layout().scratch + k) as i64 - GP_VA as i64) as i16 as u16
 }
 
-/// Where the turn scheduler hook lives: the preserved rodata gap below ARENA1
+/// Where the texture request lives: the preserved rodata gap below ARENA1
 /// (zero on a retail disc; the bonus-drop family of patcher hooks uses the same
 /// run, so this route and those exclude each other).
 pub const HOOK_VA: u32 = 0x8007_AB80;
 pub const HOOK_END_VA: u32 = 0x8007_AE00;
-/// The turn scheduler's `addu v0,v0,v1` (the per-turn readef base) that the
-/// hook replaces, in the battle overlay.
-const SCHED_SITE_VA: u32 = 0x801D_B0F0;
-const SCHED_RETAIL: u32 = 0x0043_1021;
 /// Spells at or above this id are monster specials: no party cast streams a
 /// texture bank for them.
 const MONSTER_SPELL_MIN: u16 = 0xA1;
@@ -212,7 +208,7 @@ fn words_to_bytes(w: Vec<u32>) -> Vec<u8> {
 
 /// The queue hook stub that replaces the `jal` to the Super-Art applier.
 /// Seat 0 only (the host); `table_va` holds the constant -> spell table.
-pub fn assemble_route(table_va: u32) -> Vec<u8> {
+pub fn assemble_route(table_va: u32, request_va: Option<u32>) -> Vec<u8> {
     let mut a = Asm::new();
     let (done, scan, chk, next, hit) = (a.label(), a.label(), a.label(), a.label(), a.label());
     a.op(m::addiu(SP, SP, 0xFFE8));
@@ -270,6 +266,12 @@ pub fn assemble_route(table_va: u32) -> Vec<u8> {
     a.op(m::addiu(T0, ZERO, 2));
     a.op(m::sb(T0, V1, 0x1DE)); // category = Magic
     a.op(m::sb(T3, V1, 0x1DF)); // spell id over the queue head
+    if let Some(va) = request_va {
+        // the texture request lives in the rodata gap; it returns through
+        // its own copy of the epilogue below
+        a.op(m::j(va));
+        a.op(m::nop());
+    }
     a.bind(done);
     a.op(m::lw(RA, SP, 0x14));
     a.op(m::addiu(SP, SP, 0x18));
@@ -359,40 +361,37 @@ pub fn assemble_prep(l: &Layout) -> Vec<u8> {
     words_to_bytes(a.finish())
 }
 
-/// The turn scheduler hook (`FUN_801DABA4` seeds `ctx[+0x277]`, the readef
-/// group base the battle streams for the acting entity's turn). A party seat
-/// whose queue is a routed monster special (category Magic, spell id at or
-/// above [`MONSTER_SPELL_MIN`]) gets the boss's own group instead of its
-/// character's: the special's texture page (Cort's Mystic Circle rune circle,
-/// readef slot 54) streams the way it does on the boss's own turn. Entered by
-/// a `jal` that replaces the `addu v0,v0,v1` (its delay slot is the original
-/// `sb v0,0x277(a0)`, rewritten here with the final value).
-pub fn assemble_readef_hook(l: &Layout) -> Vec<u8> {
+/// The texture request of a routed monster special, jumped to from the route
+/// stub's hit path (`t3` = the spell id, the stub's frame still on the stack).
+/// A monster special's texture page streams with the boss's own readef group
+/// (Cort's Mystic Circle rune circle is slot 54 of group 18), but the host's
+/// turn streamed its character's group (Vahn's slot 0, the `BACK / READY` menu
+/// page). The queue builder runs at action-seed state `0x0C`, after state
+/// `0x0B` has waited the streaming applier (`ctx[+0x276]`) idle, so the
+/// request is safe to issue there: `ctx[+0x277]` = the group base and
+/// `ctx[+0x276] = 1` restart the applier, which streams the group's slots
+/// during the cast's own opening. A second builder pass sees the base already
+/// seeded and leaves the stream alone.
+pub fn assemble_readef_request(l: &Layout) -> Vec<u8> {
     let mut a = Asm::new();
-    let store = a.label();
+    let out = a.label();
     let readef_off = ((l.readef) as i64 - GP_VA as i64) as i16 as u16;
-    a.op(m::addu(V0, V0, V1)); // the displaced word
-    a.op(m::lbu(T0, A0, 0x274)); // acting seat
-    a.op(m::lui(T1, m::hi(ACTOR_TABLE_VA)));
-    a.op(m::sltiu(T2, T0, 3)); // party seat?
-    a.br(store, move |o| m::beq(T2, ZERO, o));
-    a.op(m::sll(T0, T0, 2)); // delay
-    a.op(m::addiu(T1, T1, m::lo(ACTOR_TABLE_VA)));
-    a.op(m::addu(T1, T1, T0));
-    a.op(m::lw(T1, T1, 0)); // actor
-    a.op(m::addiu(T2, ZERO, 2)); // (load-delay filler)
-    a.op(m::lbu(T0, T1, 0x1DE)); // category
-    a.op(m::lbu(T3, T1, 0x1DF)); // spell
-    a.br(store, move |o| m::bne(T0, T2, o)); // not Magic
-    a.op(m::sltiu(T4, T3, MONSTER_SPELL_MIN)); // delay
-    a.br(store, move |o| m::bne(T4, ZERO, o)); // a party spell
-    a.op(m::lbu(T5, GP, readef_off)); // delay
-    a.op(m::nop()); // (load delay)
-    a.br(store, move |o| m::beq(T5, ZERO, o)); // no group configured
+    a.op(m::sltiu(T4, T3, MONSTER_SPELL_MIN)); // a party spell?
+    a.br(out, move |o| m::bne(T4, ZERO, o));
+    a.op(m::lbu(T5, GP, readef_off)); // delay: configured group base
+    a.op(m::lui(T6, m::hi(CTX_PTR_VA)));
+    a.op(m::lw(T6, T6, m::lo(CTX_PTR_VA))); // ctx
+    a.br(out, move |o| m::beq(T5, ZERO, o)); // no group configured
+    a.op(m::addiu(T0, ZERO, 1)); // delay
+    a.op(m::lbu(T7, T6, 0x277)); // the base now seeded
     a.op(m::nop());
-    a.op(m::addu(V0, T5, ZERO));
-    a.bind(store);
-    a.op(m::sb(V0, A0, 0x277));
+    a.br(out, move |o| m::beq(T7, T5, o)); // already requested
+    a.op(m::nop());
+    a.op(m::sb(T5, T6, 0x277));
+    a.op(m::sb(T0, T6, 0x276));
+    a.bind(out);
+    a.op(m::lw(RA, SP, 0x14)); // the route stub's epilogue
+    a.op(m::addiu(SP, SP, 0x18));
     a.op(m::jr(RA));
     a.op(m::nop());
     words_to_bytes(a.finish())
@@ -676,24 +675,6 @@ fn redirect_debit(patcher: &mut DiscPatcher, prep_va: u32) -> Result<bool> {
     Ok(true)
 }
 
-/// Patch the turn scheduler's readef base word in the battle overlay.
-fn redirect_scheduler(patcher: &mut DiscPatcher, hook_va: u32) -> Result<bool> {
-    let entry = patcher.read_entry(898)?;
-    let at = (SCHED_SITE_VA - 0x801C_E818) as usize;
-    let word = u32::from_le_bytes(entry[at..at + 4].try_into()?);
-    let hooked = m::jal(hook_va);
-    if word == hooked {
-        return Ok(false);
-    }
-    if word != SCHED_RETAIL {
-        bail!(
-            "scheduler site {SCHED_SITE_VA:#010x}: expected {SCHED_RETAIL:#010x}, found {word:#010x}"
-        );
-    }
-    patcher.patch_prot_entry(898, at as u64, &hooked.to_le_bytes())?;
-    Ok(true)
-}
-
 /// Install the route for `specials`: the queue hook, the cast prep helper and
 /// its tables, the module edits and the spell-name banner gate. `pool` maps
 /// each spell to the record[0] offset of its second-stage pose. Returns
@@ -708,7 +689,7 @@ pub fn install(
         bail!("module cast route needs at least one special");
     }
     let l = layout();
-    let route = assemble_route(l.table);
+    let route = assemble_route(l.table, (readef_base != 0).then_some(l.hook));
     if SCUS_GAP_VA + route.len() as u32 > SCUS_GAP_END_VA {
         bail!("module-cast route stub does not fit the SCUS gap");
     }
@@ -726,13 +707,12 @@ pub fn install(
     changed |= write_scus(patcher, l.rows, &row_table(specials, pool)?)?;
     changed |= redirect_debit(patcher, l.prep)?;
     if readef_base != 0 {
-        let hook = assemble_readef_hook(&l);
+        let hook = assemble_readef_request(&l);
         if l.hook + hook.len() as u32 > HOOK_END_VA {
-            bail!("readef hook does not fit its gap");
+            bail!("readef request does not fit its gap");
         }
         changed |= write_scus(patcher, l.hook, &hook)?;
         changed |= write_scus(patcher, l.readef, &[readef_base])?;
-        changed |= redirect_scheduler(patcher, l.hook)?;
     }
     changed |= legaia_delilas_party::delilas_cast::redirect_applier_call(patcher, SCUS_GAP_VA)?;
     changed |= legaia_delilas_party::delilas_cast::install_cast_label_gate(patcher)?;
@@ -778,7 +758,7 @@ mod tests {
     fn route(char_idx: u32, super_fired: u32, queue: &[u8]) -> (u8, u8) {
         let mut cpu = Cpu::new();
         let l = layout();
-        cpu.load(SCUS_GAP_VA, &assemble_route(l.table));
+        cpu.load(SCUS_GAP_VA, &assemble_route(l.table, None));
         cpu.load(l.table, &table(&SPECIALS));
         // the applier: returns at once
         cpu.load_words(APPLIER_VA, &[m::jr(RA), m::nop()]);
@@ -913,54 +893,43 @@ mod tests {
         assert_eq!((r.scratch(1), r.scratch(2)), (0, 8));
     }
 
-    /// Run the readef hook for the acting seat `seat` whose queue is
-    /// `(category, spell)`; the displaced word's operands are `v0`, `v1`.
-    fn readef_hook(seat: u8, cat: u8, spell: u8, configured: u8) -> u8 {
+    /// Run the texture request for a hit on `spell`, with `configured` as the
+    /// readef base byte and `seeded` as the base already in `ctx[+0x277]`.
+    /// Returns `(ctx[+0x277], ctx[+0x276])`.
+    fn readef_request(spell: u8, configured: u8, seeded: u8) -> (u8, u8) {
         let mut cpu = Cpu::new();
         let l = layout();
-        cpu.load(l.hook, &assemble_readef_hook(&l));
+        cpu.load(l.hook, &assemble_readef_request(&l));
         cpu.wr8(l.readef, configured);
-        cpu.wr8(CTX + 0x274, seat);
-        for s in 0..8u32 {
-            cpu.wr32(ACTOR_TABLE_VA + s * 4, ACTOR + s * 0x1000);
-        }
-        let actor = ACTOR + u32::from(seat) * 0x1000;
-        cpu.wr8(actor + 0x1DE, cat);
-        cpu.wr8(actor + 0x1DF, spell);
-        cpu.r[A0 as usize] = CTX;
-        cpu.r[V0 as usize] = 2 * 5; // 3 * 5 = 15 once the addu runs
-        cpu.r[V1 as usize] = 5;
+        cpu.wr32(CTX_PTR_VA, CTX);
+        cpu.wr8(CTX + 0x277, seeded);
+        cpu.wr8(CTX + 0x276, 0);
+        cpu.wr32(STACK + 0x14, RETURN_VA); // the stub's saved ra
+        cpu.r[SP as usize] = STACK;
+        cpu.r[T3 as usize] = u32::from(spell);
         cpu.r[GP as usize] = GP_VA;
-        cpu.r[RA as usize] = RETURN_VA;
-        // the jal's delay slot: the original store
-        cpu.wr8(CTX + 0x277, 0);
         cpu.pc = l.hook;
         cpu.run_until(&[RETURN_VA]);
-        cpu.rd8(CTX + 0x277)
+        assert_eq!(cpu.r[SP as usize], STACK + 0x18, "stub frame popped");
+        (cpu.rd8(CTX + 0x277), cpu.rd8(CTX + 0x276))
     }
 
     #[test]
-    fn a_routed_monster_special_streams_the_boss_group() {
-        assert_eq!(readef_hook(0, 2, 0xB7, 0x36), 0x36);
-        assert_eq!(readef_hook(2, 2, 0xAD, 0x36), 0x36);
+    fn a_routed_monster_special_requests_the_boss_group() {
+        assert_eq!(readef_request(0xB7, 0x36, 0), (0x36, 1));
+        assert_eq!(readef_request(0xAD, 0x36, 0), (0x36, 1));
     }
 
     #[test]
-    fn every_other_turn_keeps_its_own_group() {
-        for (seat, cat, spell) in [
-            (3u8, 2u8, 0xB7u8), // a monster's turn
-            (0, 2, 0x81),       // a party Seru cast
-            (0, 2, 0x37),       // Guilty Cross (no texture bank)
-            (0, 1, 0xB7),       // an item
-            (0, 3, 0x0F),       // a swing
-        ] {
-            assert_eq!(
-                readef_hook(seat, cat, spell, 0x36),
-                15,
-                "{seat} {cat} {spell:#x}"
-            );
-        }
-        assert_eq!(readef_hook(0, 2, 0xB7, 0), 15, "no group configured");
+    fn a_second_builder_pass_leaves_the_stream_alone() {
+        assert_eq!(readef_request(0xB7, 0x36, 0x36), (0x36, 0));
+    }
+
+    #[test]
+    fn party_spells_and_unconfigured_builds_request_nothing() {
+        assert_eq!(readef_request(0x37, 0x36, 0), (0, 0), "Guilty Cross");
+        assert_eq!(readef_request(0x4B, 0x36, 0), (0, 0), "Hyper Crush");
+        assert_eq!(readef_request(0xB7, 0, 0), (0, 0), "no group configured");
     }
 
     fn words(b: &[u8]) -> Vec<u32> {
@@ -972,9 +941,9 @@ mod tests {
     #[test]
     fn no_stub_reads_a_register_in_its_load_delay() {
         let l = layout();
-        assert!(crate::hazard::load_hazards(&words(&assemble_route(l.table))).is_empty());
+        assert!(crate::hazard::load_hazards(&words(&assemble_route(l.table, None))).is_empty());
         assert!(crate::hazard::load_hazards(&words(&assemble_prep(&l))).is_empty());
-        assert!(crate::hazard::load_hazards(&words(&assemble_readef_hook(&l))).is_empty());
+        assert!(crate::hazard::load_hazards(&words(&assemble_readef_request(&l))).is_empty());
     }
 
     #[test]
@@ -983,8 +952,11 @@ mod tests {
         assert!(l.prep as usize + assemble_prep(&l).len() <= ARENA1_END_VA as usize);
         assert!(l.rows as usize + ROW_SLOTS * 4 <= l.readef as usize);
         assert!(l.readef < ARENA2_END_VA);
-        assert!(l.hook as usize + assemble_readef_hook(&l).len() <= HOOK_END_VA as usize);
-        assert!(SCUS_GAP_VA as usize + assemble_route(l.table).len() <= SCUS_GAP_END_VA as usize);
+        assert!(l.hook as usize + assemble_readef_request(&l).len() <= HOOK_END_VA as usize);
+        assert!(
+            SCUS_GAP_VA as usize + assemble_route(l.table, Some(l.hook)).len()
+                <= SCUS_GAP_END_VA as usize
+        );
         // gp-relative scratch reaches: 0x8007AFF8 - 0x8007B318 = -0x320
         assert_eq!(gp_off(0), 0xFCE0);
     }
