@@ -315,6 +315,44 @@ pub struct ClipMap {
     pub spirit: Option<usize>,
 }
 
+/// Tag the synthesized melee clips carry (a single-hit move).
+const SYNTH_MELEE_TAG: u8 = 0x0E;
+
+/// For a boss with no melee of its own (Cort's first form only casts): add
+/// single-hit clips cloned from its two shortest cast clips, one hit event on
+/// the pose the cast holds (or two thirds in), no effect script, sound cue or
+/// loop window. Returns how many were added; none when the boss attacks.
+pub fn add_cast_melee(clips: &mut Vec<BossClip>) -> usize {
+    let attack = |c: &BossClip| (0x0C..=0x1F).contains(&c.tag) && !c.events().is_empty();
+    if clips.iter().any(attack) {
+        return 0;
+    }
+    let mut casts: Vec<BossClip> = clips.iter().filter(|c| c.tag == 0x23).cloned().collect();
+    casts.sort_by_key(BossClip::len);
+    let mut added = 0;
+    for mut c in casts.into_iter().take(2) {
+        let n = c.len();
+        let ev = if c.head[0x84] != 0 {
+            c.head[0x85] as usize
+        } else {
+            n * 2 / 3
+        };
+        c.head[0x10..0x14].copy_from_slice(&[ev.clamp(1, n.saturating_sub(1)) as u8, 0, 0, 0]);
+        c.head[0x14..0x74].fill(0);
+        c.head[0x84..0x87].fill(0);
+        c.tag = SYNTH_MELEE_TAG;
+        c.head[0] = SYNTH_MELEE_TAG;
+        c.entry += 0x100;
+        clips.push(c);
+        added += 1;
+    }
+    added
+}
+
+/// Rate-1 clips up to this many frames are never decimated (halving the
+/// poses would double their speed).
+const RATE1_KEEP: usize = 24;
+
 fn find_tag(clips: &[BossClip], tag: u8) -> Option<usize> {
     clips.iter().position(|c| c.tag == tag)
 }
@@ -335,7 +373,13 @@ pub fn default_clip_map(clips: &[BossClip]) -> Result<ClipMap> {
         (5, 5),
         (0xB, 0xB),
     ] {
-        slots.insert(slot, need(tag)?);
+        // A boss that never blocks plays its idle for the host's Block.
+        let ci = match find_tag(clips, tag) {
+            Some(ci) => ci,
+            None if tag == 0xB => idle,
+            None => need(tag)?,
+        };
+        slots.insert(slot, ci);
     }
     slots.insert(7, idle);
     slots.insert(8, idle);
@@ -832,7 +876,14 @@ pub fn rebuild_record0(
             Some(&ci) if populated => {
                 let (parts, _) = rec0.stream_shape(slot).unwrap();
                 let clip = match plan.decimate_over {
-                    Some(cap) if clips[ci].len() > cap => clips[ci].decimated(2),
+                    // A rate-1 clip cannot halve its rate, so decimating it
+                    // would play it twice as fast: only the long ones go.
+                    Some(cap)
+                        if clips[ci].len() > cap
+                            && (clips[ci].rate() >= 2 || clips[ci].len() > RATE1_KEEP) =>
+                    {
+                        clips[ci].decimated(2)
+                    }
                     _ => clips[ci].clone(),
                 };
                 let e = inline_entry(

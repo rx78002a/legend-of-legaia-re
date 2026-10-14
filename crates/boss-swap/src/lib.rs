@@ -89,11 +89,13 @@ pub struct Report {
 /// Clip lengths above which a clip is decimated (half the frames, half the
 /// rate) when the rebuilt player file does not fit; `None` keeps every pose.
 /// The second field also decimates the stage poses.
-const DECIMATE_CAPS: [(Option<usize>, bool); 6] = [
+const DECIMATE_CAPS: [(Option<usize>, bool); 8] = [
     (None, false),
     (Some(40), false),
     (Some(30), false),
     (Some(22), false),
+    (Some(16), false),
+    (Some(12), false),
     (Some(22), true),
     (Some(16), true),
 ];
@@ -123,6 +125,9 @@ pub fn apply(patcher: &mut DiscPatcher, opts: &Options) -> Result<Report> {
                     || text.contains("needs") && text.contains("bytes, the slot holds");
                 if !size {
                     return Err(e);
+                }
+                if std::env::var_os("BOSS_DEBUG").is_some() {
+                    eprintln!("cap {cap:?} stage {stage}: {text}");
                 }
                 last = Some(e);
             }
@@ -194,6 +199,12 @@ fn apply_with(
     } else {
         None
     };
+    let synthesized = boss::add_cast_melee(&mut clips);
+    if synthesized > 0 {
+        report.notes.push(format!(
+            "no melee clip: {synthesized} swing clips cloned from the boss's cast clips"
+        ));
+    }
     let calm = if opts.calm_support {
         Some(boss::add_calm_clips(&mut clips)?)
     } else {
@@ -217,6 +228,7 @@ fn apply_with(
     plan.fireball_swing = swing_fireball;
     plan.decimate_over = decimate_over;
     plan.decimate_stage = decimate_stage;
+    let mut pool_spells: Vec<u8> = Vec::new();
     if !module_specials.is_empty() {
         // The modules stage the caster by raw monster action index; those
         // exact entries are authored as stage poses. The first stage lives on
@@ -227,13 +239,24 @@ fn apply_with(
                 .position(|c| c.entry == entry)
                 .unwrap_or_else(|| map_idle(&plan))
         };
-        let mut first = None;
+        let mut first: Option<usize> = None;
         let mut second_clips = Vec::new();
         for s in &module_specials {
             let (one, two) = module_cast::stage_entries(s.spell)
                 .with_context(|| format!("no stage entries for spell {:#04x}", s.spell))?;
-            first.get_or_insert(by_entry(one));
-            second_clips.push(by_entry(two));
+            let clip = by_entry(one);
+            match first {
+                None => first = Some(clip),
+                Some(f) if f != clip => bail!(
+                    "spell {:#04x} stages a different first pose than the others:                      row A holds one pose per build",
+                    s.spell
+                ),
+                _ => {}
+            }
+            if let Some(two) = two {
+                pool_spells.push(s.spell);
+                second_clips.push(by_entry(two));
+            }
         }
         let a = first.context("no cast-module specials")?;
         // Row 6 keeps its retail stub: the prep helper repoints its table word
@@ -360,10 +383,10 @@ fn apply_with(
         ));
     }
     if !module_specials.is_empty() {
-        let pool: Vec<(u8, usize)> = module_specials
+        let pool: Vec<(u8, usize)> = pool_spells
             .iter()
             .zip(&b.pool_offsets)
-            .map(|(s, &off)| (s.spell, off))
+            .map(|(&spell, &off)| (spell, off))
             .collect();
         let fresh = module_cast::install(patcher, &module_specials, &pool)?;
         report.notes.push(format!(
@@ -410,12 +433,7 @@ fn module_route(
         .iter()
         .copied()
         .filter(|&s| s > 1 && class_of(s) == Some(b'c'))
-        .filter(|&s| {
-            matches!(
-                s,
-                module_cast::SPELL_HYPER_CRUSH | module_cast::SPELL_HYPER_LIGHTNING
-            )
-        })
+        .filter(|&s| module_cast::module_for(s).is_some())
         .collect();
     if spells.is_empty() {
         return Ok(Vec::new());

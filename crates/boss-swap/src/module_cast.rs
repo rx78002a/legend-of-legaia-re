@@ -81,8 +81,10 @@ pub const STAGE_ROW_B: u8 = 0x06;
 /// Hyper Crush and Hyper Lightning: the spell ids this route knows modules for.
 pub const SPELL_HYPER_CRUSH: u8 = 0x4B;
 pub const SPELL_HYPER_LIGHTNING: u8 = 0x4C;
-/// The row table covers spell ids `FIRST ..= FIRST + ROW_SLOTS - 1`.
-pub const ROW_FIRST: u8 = 0x4B;
+/// Cort's Guilty Cross (PROT 944).
+pub const SPELL_GUILTY_CROSS: u8 = 0x37;
+/// The row table holds up to `ROW_SLOTS` routed spells, four bytes each:
+/// `[spell, 0, pool entry offset (u16)]`, an empty slot has spell `0`.
 pub const ROW_SLOTS: usize = 4;
 
 /// One art routed into a cast module.
@@ -96,11 +98,13 @@ pub struct Special {
 
 /// The caster stage entries a module asks for, as monster action indices:
 /// `(first, second)`. The player file authors the first on row
-/// [`STAGE_ROW_A`] and the second into the pool the prep helper picks from.
-pub fn stage_entries(spell: u8) -> Option<(usize, usize)> {
+/// [`STAGE_ROW_A`] and the second (when the module stages one) into the pool
+/// the prep helper picks from.
+pub fn stage_entries(spell: u8) -> Option<(usize, Option<usize>)> {
     match spell {
-        SPELL_HYPER_CRUSH => Some((0x0D, 0x0B)),
-        SPELL_HYPER_LIGHTNING => Some((0x0D, 0x0C)),
+        SPELL_HYPER_CRUSH => Some((0x0D, Some(0x0B))),
+        SPELL_HYPER_LIGHTNING => Some((0x0D, Some(0x0C))),
+        SPELL_GUILTY_CROSS => Some((0x08, None)),
         _ => None,
     }
 }
@@ -114,7 +118,8 @@ pub struct Layout {
     pub scratch: u32,
     /// Constant -> spell table (`0x24` bytes).
     pub table: u32,
-    /// Spell -> pool entry offset, `ROW_SLOTS` halfwords (0 = not routed).
+    /// Routed spells: `ROW_SLOTS` x `[spell, 0, pool entry offset u16]`
+    /// (offset 0 = the spell stages no pooled pose).
     pub rows: u32,
     /// The cast prep helper.
     pub prep: u32,
@@ -146,15 +151,22 @@ fn table(specials: &[Special]) -> [u8; 0x24] {
     t
 }
 
-fn row_table(rows: &[(u8, usize)]) -> Result<[u8; ROW_SLOTS * 2]> {
-    let mut t = [0u8; ROW_SLOTS * 2];
-    for &(spell, off) in rows {
-        let i = usize::from(spell.wrapping_sub(ROW_FIRST));
-        if i >= ROW_SLOTS {
-            bail!("spell {spell:#04x} is outside the row table");
-        }
-        let off = u16::try_from(off).context("pool entry offset past 16 bits")?;
-        t[i * 2..i * 2 + 2].copy_from_slice(&off.to_le_bytes());
+/// The routed-spell table: every special gets a slot, with its pool entry
+/// offset from `pool` (`0` when it has none).
+fn row_table(specials: &[Special], pool: &[(u8, usize)]) -> Result<[u8; ROW_SLOTS * 4]> {
+    if specials.len() > ROW_SLOTS {
+        bail!("at most {ROW_SLOTS} routed spells");
+    }
+    let mut t = [0u8; ROW_SLOTS * 4];
+    for (i, s) in specials.iter().enumerate() {
+        let off = pool
+            .iter()
+            .find(|(sp, _)| *sp == s.spell)
+            .map_or(Ok(0), |&(_, off)| {
+                u16::try_from(off).context("pool entry offset past 16 bits")
+            })?;
+        t[i * 4] = s.spell;
+        t[i * 4 + 2..i * 4 + 4].copy_from_slice(&off.to_le_bytes());
     }
     Ok(t)
 }
@@ -238,6 +250,7 @@ pub fn assemble_route(table_va: u32) -> Vec<u8> {
 pub fn assemble_prep(l: &Layout) -> Vec<u8> {
     let mut a = Asm::new();
     let (enemy, write, nz, ret) = (a.label(), a.label(), a.label(), a.label());
+    let (scan, found) = (a.label(), a.label());
     a.op(m::lhu(V0, S3, 0x150)); // MP
     a.op(m::lbu(V1, S5, 2)); // caster seat
     a.op(m::lui(T0, m::hi(CTX_PTR_VA)));
@@ -273,25 +286,29 @@ pub fn assemble_prep(l: &Layout) -> Vec<u8> {
     // A routed party Magic cast: MP-neutral, and row 6 points at the pose.
     a.br(ret, move |o| m::beq(T3, ZERO, o));
     a.op(m::lbu(T0, S3, 0x1DE)); // delay: category
-    a.op(m::addiu(T1, ZERO, 2));
-    a.op(m::nop());
+    a.op(m::addiu(T1, ZERO, 2)); // (fills the lbu's load delay)
     a.br(ret, move |o| m::bne(T0, T1, o));
     a.op(m::nop());
     a.op(m::lbu(T0, S3, 0x1DF)); // spell
-    a.op(m::nop());
-    a.op(m::addiu(T0, T0, 0u16.wrapping_sub(u16::from(ROW_FIRST))));
-    a.op(m::sltiu(T1, T0, ROW_SLOTS as u16));
-    a.br(ret, move |o| m::beq(T1, ZERO, o));
-    a.op(m::sll(T0, T0, 1)); // delay
     a.op(m::lui(T1, m::hi(l.rows)));
-    a.op(m::addiu(T1, T1, m::lo(l.rows)));
-    a.op(m::addu(T1, T1, T0));
-    a.op(m::lhu(T1, T1, 0)); // pool entry offset
+    a.br(ret, move |o| m::beq(T0, ZERO, o));
+    a.op(m::addiu(T1, T1, m::lo(l.rows))); // delay
+    a.op(m::addiu(T2, ZERO, ROW_SLOTS as u16));
+    a.bind(scan);
+    a.op(m::lbu(T4, T1, 0)); // routed spell of this slot
+    a.op(m::addiu(T2, T2, 0xFFFF)); // (fills the lbu's load delay)
+    a.br(found, move |o| m::beq(T4, T0, o));
+    a.op(m::addiu(T1, T1, 4)); // delay: next slot (found reads one back)
+    a.br(scan, move |o| m::bne(T2, ZERO, o));
     a.op(m::nop());
-    a.br(ret, move |o| m::beq(T1, ZERO, o)); // not routed
+    a.br(ret, move |o| m::beq(ZERO, ZERO, o)); // not routed
     a.op(m::nop());
+    a.bind(found);
     a.op(m::addu(V0, V0, S0)); // the debit leaves the MP where it was
-    a.op(m::sll(T0, V1, 2));
+    a.op(m::lhu(T1, T1, 0xFFFE)); // pool entry offset (slot + 4 - 2)
+    a.op(m::nop());
+    a.br(ret, move |o| m::beq(T1, ZERO, o)); // no pooled pose
+    a.op(m::sll(T0, V1, 2)); // delay
     a.op(m::lui(T2, m::hi(RECORD0_TABLE_VA)));
     a.op(m::addiu(T2, T2, m::lo(RECORD0_TABLE_VA)));
     a.op(m::addu(T0, T0, T2));
@@ -438,11 +455,25 @@ pub fn edits_937() -> Vec<ModuleEdit> {
     ]
 }
 
+/// PROT 944 (Guilty Cross, `0x37`) edits. Everything in the body goes by
+/// seat (the victim off `caster[+0x1DD]`, both rows hidden by their own
+/// counts, the caster re-shown by pointer), so only the caster's one stage
+/// pose moves: raw row 8 (the Recover row on a party, whose tag byte re-stages
+/// itself) becomes row `0x0A`.
+pub fn edits_944() -> Vec<ModuleEdit> {
+    vec![ModuleEdit {
+        va: 0x801F_6B50,
+        expect: 0x2402_0008,
+        replace: stage_imm(STAGE_ROW_A),
+    }]
+}
+
 /// Module PROT entry and edits for a spell.
 pub fn module_for(spell: u8) -> Option<(usize, Vec<ModuleEdit>)> {
     match spell {
         SPELL_HYPER_CRUSH => Some((936, edits_936())),
         SPELL_HYPER_LIGHTNING => Some((937, edits_937())),
+        SPELL_GUILTY_CROSS => Some((944, edits_944())),
         _ => None,
     }
 }
@@ -540,14 +571,14 @@ pub fn install(
     if l.prep + prep.len() as u32 > ARENA1_END_VA {
         bail!("module-cast prep helper does not fit ARENA1");
     }
-    if l.rows + (ROW_SLOTS * 2) as u32 > ARENA2_END_VA {
+    if l.rows + (ROW_SLOTS * 4) as u32 > ARENA2_END_VA {
         bail!("module-cast tables do not fit ARENA2");
     }
     let mut changed = false;
     changed |= write_scus(patcher, SCUS_GAP_VA, &route)?;
     changed |= write_scus(patcher, l.prep, &prep)?;
     changed |= write_scus(patcher, l.table, &table(specials))?;
-    changed |= write_scus(patcher, l.rows, &row_table(pool)?)?;
+    changed |= write_scus(patcher, l.rows, &row_table(specials, pool)?)?;
     changed |= redirect_debit(patcher, l.prep)?;
     changed |= legaia_delilas_party::delilas_cast::redirect_applier_call(patcher, SCUS_GAP_VA)?;
     changed |= legaia_delilas_party::delilas_cast::install_cast_label_gate(patcher)?;
@@ -574,7 +605,7 @@ mod tests {
     const REC0: u32 = 0x8012_0000;
     const RETURN_VA: u32 = 0x801E_FA00;
     const STACK: u32 = 0x801F_F000;
-    const SPECIALS: [Special; 2] = [
+    const SPECIALS: [Special; 3] = [
         Special {
             constant: 0x27,
             spell: 0x4B,
@@ -582,6 +613,10 @@ mod tests {
         Special {
             constant: 0x29,
             spell: 0x4C,
+        },
+        Special {
+            constant: 0x2B,
+            spell: 0x37,
         },
     ];
 
@@ -638,7 +673,7 @@ mod tests {
         cpu.load(l.prep, &assemble_prep(&l));
         cpu.load(
             l.rows,
-            &row_table(&[(0x4B, 0x1234), (0x4C, 0x2468)]).unwrap(),
+            &row_table(&SPECIALS, &[(0x4B, 0x1234), (0x4C, 0x2468)]).unwrap(),
         );
         cpu.wr32(CTX_PTR_VA, CTX);
         cpu.wr8(CTX, party);
@@ -711,6 +746,14 @@ mod tests {
     }
 
     #[test]
+    fn a_spell_without_a_pooled_pose_is_still_mp_neutral() {
+        let r = prep(0, 2, 0x37, 42, 60, 3, 2);
+        assert_eq!(r.mp(), 42 + 60);
+        assert_eq!(r.cpu.rd32(REC0 + 6 * 4), 0, "no row repoint");
+        assert_eq!((r.scratch(0), r.scratch(1)), (3, 5));
+    }
+
+    #[test]
     fn no_victims_means_end_zero() {
         let r = prep(0, 2, 0x4B, 1, 1, 3, 0);
         assert_eq!((r.scratch(1), r.scratch(2)), (0, 8));
@@ -733,7 +776,7 @@ mod tests {
     fn everything_fits() {
         let l = layout();
         assert!(l.prep as usize + assemble_prep(&l).len() <= ARENA1_END_VA as usize);
-        assert!(l.rows as usize + ROW_SLOTS * 2 <= ARENA2_END_VA as usize);
+        assert!(l.rows as usize + ROW_SLOTS * 4 <= ARENA2_END_VA as usize);
         assert!(SCUS_GAP_VA as usize + assemble_route(l.table).len() <= SCUS_GAP_END_VA as usize);
         // gp-relative scratch reaches: 0x8007AFF8 - 0x8007B318 = -0x320
         assert_eq!(gp_off(0), 0xFCE0);

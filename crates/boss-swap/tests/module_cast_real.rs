@@ -96,8 +96,9 @@ fn check(p: &DiscPatcher) {
         "row 6 is not authored"
     );
     for (spell, slot) in [(0x4Bu8, 0usize), (0x4C, 1)] {
-        let at = off(l.rows) + slot * 2;
-        let entry = u16::from_le_bytes(scus[at..at + 2].try_into().unwrap()) as usize;
+        let at = off(l.rows) + slot * 4;
+        assert_eq!(scus[at], spell, "slot {slot} routes spell {spell:#x}");
+        let entry = u16::from_le_bytes(scus[at + 2..at + 4].try_into().unwrap()) as usize;
         assert!(entry != 0, "spell {spell:#x} has a pool entry");
         assert!(entry + 0xAC + 2 < r0.decoded.len(), "inside record[0]");
         assert!(entry < r0.clut_a, "below the load-time scratch");
@@ -135,7 +136,7 @@ fn route_lands_on_the_patched_image() {
         .iter()
         .enumerate()
         .map(|(i, &sp)| {
-            let off = u16::from_le_bytes(scus[at + i * 2..at + i * 2 + 2].try_into().unwrap());
+            let off = u16::from_le_bytes(scus[at + i * 4 + 2..at + i * 4 + 4].try_into().unwrap());
             (sp, usize::from(off))
         })
         .collect();
@@ -169,4 +170,44 @@ fn songi_first_form_is_unchanged() {
         p.read_entry(936).unwrap(),
         DiscPatcher::open(image).unwrap().read_entry(936).unwrap()
     );
+}
+
+/// Cort's first form (#180) casts only Guilty Cross (PROT 944): one routed
+/// spell, one stage immediate, no pooled pose, and a melee set cloned from its
+/// cast clips (it has no attack of its own).
+#[test]
+fn cort_first_form_routes_guilty_cross() {
+    let Some(image) = disc() else { return };
+    let mut p = DiscPatcher::open(image).expect("open disc");
+    let report = apply(
+        &mut p,
+        &Options {
+            monster: 180,
+            ..Options::default()
+        },
+    )
+    .expect("apply boss swap");
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|n| n.contains("swing clips cloned"))
+    );
+    let m944 = p.read_entry(944).unwrap();
+    for e in module_cast::edits_944() {
+        assert_eq!(word(&m944, e.va), e.replace, "944 {:#x}", e.va);
+    }
+    let scus = p.read_named_file("SCUS_942.54").unwrap();
+    let l = module_cast::layout();
+    let off = |va: u32| legaia_game_tables::item_names::file_offset_for_va(&scus, va).unwrap();
+    assert_eq!(scus[off(l.table) + 0x27 - 0x10], 0x37);
+    let at = off(l.rows);
+    assert_eq!(
+        &scus[at..at + 4],
+        &[0x37, 0, 0, 0],
+        "routed, no pooled pose"
+    );
+    let r0 = Record0::parse(&p.read_entry_footprint(863).unwrap()).unwrap();
+    let (parts, frames) = r0.stream_shape(0x0A).expect("row A");
+    assert!(parts > 0 && frames > 0, "row 0xa authored");
 }

@@ -16,6 +16,9 @@ fn main() -> Result<()> {
     if args.first().map(String::as_str) == Some("monster") && args.len() >= 4 {
         return monster(&args);
     }
+    if args.first().map(String::as_str) == Some("clips") && args.len() >= 3 {
+        return clips(&args);
+    }
     if args.first().map(String::as_str) == Some("render") && args.len() >= 3 {
         return render(&args);
     }
@@ -220,6 +223,53 @@ fn render(args: &[String]) -> Result<()> {
 
 /// `monster <disc> <out.png> <id> [--only a,b]`: the unmodified monster, rest
 /// pose, for comparing against a swapped build.
+/// `clips <disc> ID`: every animation of a monster with the head fields the
+/// stage plan reads, and the spells its record lists.
+fn clips(args: &[String]) -> Result<()> {
+    let resolved = legaia_iso::raw::resolve_disc_path(std::path::Path::new(&args[1]))?;
+    let patcher = DiscPatcher::open(std::fs::read(&resolved)?)?;
+    let archive = patcher.read_entry_footprint(legaia_boss_swap::MONSTER_ARCHIVE_ENTRY)?;
+    let id: u16 = args[2].parse()?;
+    let block = legaia_actor_formats::monster_archive::decode_block(&archive, id)?
+        .context("empty monster slot")?;
+    println!(
+        "monster {id}: spells {:02x?}, record +0x20..0x28 {:02x?}",
+        block.get(0x21..0x24).unwrap_or(&[]),
+        block.get(0x20..0x28).unwrap_or(&[])
+    );
+    for c in legaia_party_swap::playerize::boss::boss_clips(&archive, id)? {
+        let h = &c.head;
+        let fx: Vec<String> = (0..8)
+            .map(|r| 0x14 + r * 8)
+            .filter(|&o| h[o] != 0 || h[o + 1] != 0)
+            .map(|o| format!("f{}:{:02x?}", h[o], &h[o + 1..o + 8]))
+            .collect();
+        let cues: Vec<String> = (0x54..0x74)
+            .step_by(4)
+            .filter(|&o| h[o + 2] != 0 || h[o + 3] != 0)
+            .map(|o| {
+                format!(
+                    "f{}:{:#x}",
+                    u16::from_le_bytes([h[o], h[o + 1]]),
+                    u16::from_le_bytes([h[o + 2], h[o + 3]])
+                )
+            })
+            .collect();
+        println!(
+            "entry {:#04x} tag {:#04x} frames {:3} rate {} events {:?} window {:?} fx {:?} cues {:?}",
+            c.entry,
+            c.tag,
+            c.len(),
+            h[0x78],
+            c.events(),
+            &h[0x84..0x87],
+            fx,
+            cues
+        );
+    }
+    Ok(())
+}
+
 fn monster(args: &[String]) -> Result<()> {
     use legaia_actor_formats::{mesh_raster, monster_archive};
     let resolved = legaia_iso::raw::resolve_disc_path(std::path::Path::new(&args[1]))?;
