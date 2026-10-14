@@ -211,3 +211,30 @@ fn cort_first_form_routes_guilty_cross() {
     let (parts, frames) = r0.stream_shape(0x0A).expect("row A");
     assert!(parts > 0 && frames > 0, "row 0xa authored");
 }
+
+/// Cort's left face half lives in the companion TIM (slot id + 8): the build
+/// adopts it instead of dropping the prims.
+#[test]
+fn cort_face_comes_from_the_companion_page() {
+    let Some(image) = disc() else { return };
+    let mut p = DiscPatcher::open(image).expect("open disc");
+    let archive = p.read_entry_footprint(867).unwrap();
+    let page = legaia_actor_formats::monster_archive::companion_page(&archive, 180)
+        .unwrap()
+        .expect("companion TIM of #180");
+    assert_eq!((page.cluts.len(), page.width), (16, 256));
+    assert!(page.cluts[1][1] != 0, "palette 1 is populated");
+    let report = apply(
+        &mut p,
+        &Options {
+            monster: 180,
+            ..Options::default()
+        },
+    )
+    .expect("apply boss swap");
+    assert!(
+        !report.notes.iter().any(|n| n.contains("were dropped")),
+        "{:?}",
+        report.notes
+    );
+}

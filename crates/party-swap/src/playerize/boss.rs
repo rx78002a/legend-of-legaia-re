@@ -28,8 +28,8 @@
 
 use super::super::*;
 use super::{
-    decode_record, monster_pool_texels, rebuild_player_file_unbounded, relayout_to_band,
-    rewrite_section_record,
+    COMPANION_PAL_BASE, decode_record, monster_pool_texels, rebuild_player_file_unbounded,
+    relayout_to_band, rewrite_section_record,
 };
 use crate::winpose::{READEF_SLOT, encode_channel_delta, pack_part};
 use legaia_actor_formats::me_archive;
@@ -1178,13 +1178,31 @@ fn scale_object(o: &mut ModelObject, s: f32) -> Result<()> {
 const NOMINAL_CLUT_ROW: u16 = 481;
 const NOMINAL_PAGE_COL: u16 = 5;
 
-/// The late bosses (ids 179..=186: Songi's third form, the Corts, Koru) carry
-/// prims authored one row and one page past their own: the loader relocates
-/// them onto the **next slot's** CLUT row and texture page, which holds
-/// nothing of the boss's. Re-laying them out against the boss's own pool shows
-/// the wrong texels (Cort: a strip of cloak across half the face). A small
-/// number of them is dropped (the layer under them, hair for Cort, shows
-/// instead); a boss with many keeps them and warns.
+/// Point every prim that addresses the next slot at the companion page
+/// ([`monster_archive::companion_page`]): its palette id moves to
+/// `COMPANION_PAL_BASE + palette`, which `relayout_to_band` reads from the
+/// companion's texels and CLUTs. Returns how many prims moved.
+fn adopt_companion_prims(objects: &mut [ModelObject]) -> usize {
+    let mut n = 0;
+    for o in objects.iter_mut() {
+        for g in &mut o.groups {
+            for p in &mut g.prims {
+                if !p.uvs.is_empty()
+                    && ((p.cba >> 6) != NOMINAL_CLUT_ROW || (p.tsb & 0xF) != NOMINAL_PAGE_COL)
+                {
+                    p.cba = (NOMINAL_CLUT_ROW << 6) | (COMPANION_PAL_BASE + (p.cba & 0x3F));
+                    n += 1;
+                }
+            }
+        }
+    }
+    n
+}
+
+/// Fallback for a boss whose next-slot prims have no companion page (see
+/// [`adopt_companion_prims`]): a small number of them is dropped (the layer
+/// under them shows instead); a boss with many keeps them as authored and
+/// warns.
 fn drop_foreign_prims(objects: &mut [ModelObject], warnings: &mut Vec<String>) {
     let foreign = |p: &legaia_tmd::encode::ModelPrim| {
         !p.uvs.is_empty() && ((p.cba >> 6) != NOMINAL_CLUT_ROW || (p.tsb & 0xF) != NOMINAL_PAGE_COL)
@@ -1239,8 +1257,21 @@ pub fn boss_geometry(
     let pool = mesh
         .texture_pool_bytes()
         .ok_or_else(|| anyhow::anyhow!("monster id {id}: no texture pool"))?;
-    let (cluts, indices, width) = monster_pool_texels(pool)?;
-    drop_foreign_prims(&mut objects, &mut warnings);
+    let (mut cluts, indices, width) = monster_pool_texels(pool)?;
+    let companion = monster_archive::companion_page(archive, id)?;
+    let companion_src = match &companion {
+        Some(c) if adopt_companion_prims(&mut objects) > 0 => {
+            // Palette ids: the boss's own 15 first, the companion's 16 at
+            // `COMPANION_PAL_BASE`.
+            cluts.resize(usize::from(COMPANION_PAL_BASE), [0u16; 16]);
+            cluts.extend(c.cluts.iter().copied());
+            Some((c.indices.as_slice(), c.width))
+        }
+        _ => {
+            drop_foreign_prims(&mut objects, &mut warnings);
+            None
+        }
+    };
     for o in objects.iter_mut() {
         scale_object(o, scale)?;
         compact_object(o);
@@ -1260,6 +1291,7 @@ pub fn boss_geometry(
         &cluts,
         &indices,
         width,
+        companion_src,
         &reserved,
         None,
         downscale,

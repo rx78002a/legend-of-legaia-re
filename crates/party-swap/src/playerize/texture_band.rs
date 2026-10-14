@@ -224,6 +224,11 @@ pub(in super::super) fn nearest_color(colors: &[u16], c: u16) -> usize {
     best
 }
 
+/// Palette ids at and above this belong to the companion page (a second
+/// source page whose 16 CLUTs sit at `COMPANION_PAL_BASE..`), so a prim of it
+/// never shares an island, a palette group or a texel with the primary page.
+pub(super) const COMPANION_PAL_BASE: u16 = 32;
+
 fn face_palette(objects: &[ModelObject], f: &FaceRef) -> u16 {
     objects[f.obj].groups[f.group].prims[f.prim].cba & 0x3F
 }
@@ -243,6 +248,7 @@ pub(super) fn relayout_to_band(
     cluts: &[[u16; 16]],
     indices: &[u8],
     src_width: usize,
+    companion: Option<(&[u8], usize)>,
     reserved_cols: &[u16],
     exclude_section: Option<usize>,
     base_scale: u32,
@@ -261,7 +267,7 @@ pub(super) fn relayout_to_band(
                     obj: oi,
                     group: gi,
                     prim: pi,
-                    page: 0,
+                    page: usize::from(companion.is_some() && (p.cba & 0x3F) >= COMPANION_PAL_BASE),
                     bbox: face_bbox(&p.uvs),
                 });
             }
@@ -405,11 +411,15 @@ pub(super) fn relayout_to_band(
     // (bounded seam residual - same limitation the OBJ importer has).
     let mut tiles: Vec<Vec<u8>> = regions.iter().map(|r| vec![0u8; r.w * r.h]).collect();
     let mut painted: Vec<Vec<bool>> = regions.iter().map(|r| vec![false; r.w * r.h]).collect();
-    let src_texel = |x: usize, y: usize| -> u8 {
-        if x >= src_width || y >= PAGE_HEIGHT {
+    let src_texel = |page: usize, x: usize, y: usize| -> u8 {
+        let (ind, w) = match (page, companion) {
+            (1, Some(c)) => c,
+            _ => (indices, src_width),
+        };
+        if x >= w || y >= PAGE_HEIGHT {
             return 0;
         }
-        indices[y * src_width + x]
+        ind[y * w + x]
     };
     for (ci, c) in clusters.iter().enumerate() {
         let (ri, dx, dy) = placement[ci];
@@ -434,7 +444,7 @@ pub(super) fn relayout_to_band(
                     if painted[ri][at] {
                         continue;
                     }
-                    let idx = src_texel(sx, sy) as usize;
+                    let idx = src_texel(f.page, sx, sy) as usize;
                     let color = cluts[src_pal][idx];
                     let new_idx = if idx == 0 || color == 0 {
                         0

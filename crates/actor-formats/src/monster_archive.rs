@@ -208,6 +208,7 @@
 use anyhow::{Result, bail};
 
 mod animation;
+mod companion;
 mod mesh;
 mod rebuild;
 mod record;
@@ -215,6 +216,7 @@ mod slim;
 mod texture_page;
 
 pub use animation::*;
+pub use companion::*;
 pub use mesh::*;
 pub use rebuild::*;
 pub use record::*;

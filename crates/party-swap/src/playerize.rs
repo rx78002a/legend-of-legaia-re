@@ -45,7 +45,7 @@ pub use rebuild::{rebuild_player_file, rebuild_player_file_unbounded};
 use section_record::rewrite_section_record;
 pub use section_record::{alias_variant_onto_bone, splice_record_tmd, variant_object};
 pub use texture_band::FACE_STAMP_WINDOWS;
-use texture_band::relayout_to_band;
+use texture_band::{COMPANION_PAL_BASE, relayout_to_band};
 pub(super) use texture_band::{merge_palettes, monster_pool_texels, nearest_color};
 /// Bytes per stored monster CLUT (16 BGR555 entries).
 const CLUT_BYTES: usize = 32;
@@ -705,6 +705,7 @@ fn playerize_scaled(
         &cluts,
         &indices,
         src_width,
+        None,
         &reserved,
         fusions.weapon_section,
         texture_downscale,
