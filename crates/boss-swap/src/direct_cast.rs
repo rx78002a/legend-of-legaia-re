@@ -20,8 +20,10 @@
 //!    hit the whole queue becomes the single byte `0x0F` and the stub returns
 //!    range `0`: the state stores `0x1E` and the fireball swing plays in
 //!    place, with the queue head `0x0F` that the id map resolves. Without a
-//!    hit every plain `0x0F` in the queue becomes `0x0E`, so a bare Up press
-//!    plays the Down swing and the fireball stays a technique.
+//!    hit every plain `0x0F` in the queue becomes `0x0A` - record[0] row
+//!    `0x0A`, which holds the Up melee the fireball displaced (or `0x0E`, the
+//!    Down swing, when that row is not authored) - so a bare Up press stays a
+//!    melee and the fireball stays a technique.
 //! 2. **Commit-time range snap** (SCUS, `0x8004BFA8`). Every clip the strike
 //!    loop commits runs a block at the end of the anim commit that calls the
 //!    range function and walks the attacker to the range boundary in a single
@@ -57,10 +59,13 @@ const SNAP_SITE_VA: u32 = 0x8004_BFA8;
 const SNAP_EXIT_VA: u32 = 0x8004_C11C;
 const SCUS_NAME: &str = "SCUS_942.54";
 
-/// Queue byte of the fireball swing (High / Up) and the swing a plain Up
-/// press is played as.
+/// Queue byte of the fireball swing (High / Up).
 pub const FIREBALL_BYTE: u8 = 0x0F;
-pub const PLAIN_UP_ALIAS: u8 = 0x0E;
+/// What a plain Up press plays as when the host's record[0] row `0x0A` holds
+/// the displaced Up melee.
+pub const UP_MELEE_BYTE: u8 = 0x0A;
+/// What it plays as otherwise: the Down swing.
+pub const DOWN_SWING_BYTE: u8 = 0x0E;
 
 /// First art constant and the number of constants the table covers
 /// (`0x10..=0x30`: every row of the 33-record art bank).
@@ -154,14 +159,14 @@ fn table(constants: &[u8]) -> [u8; TABLE_LEN] {
 }
 
 /// Assemble the attack-begin stub (SCUS gap) for a cast table at `table_va`.
-pub fn assemble_begin(table_va: u32) -> Vec<u8> {
-    begin_words(table_va)
+pub fn assemble_begin(table_va: u32, plain_up: u8) -> Vec<u8> {
+    begin_words(table_va, plain_up)
         .iter()
         .flat_map(|x| x.to_le_bytes())
         .collect()
 }
 
-fn begin_words(table_va: u32) -> Vec<u32> {
+fn begin_words(table_va: u32, plain_up: u8) -> Vec<u32> {
     let mut a = Asm::new();
     let (ret, scan, next, found, starter, chk) = (
         a.label(),
@@ -183,7 +188,7 @@ fn begin_words(table_va: u32) -> Vec<u32> {
     a.op(m::addiu(T0, S3, 0x1DF)); // queue cursor
     a.op(m::addiu(T4, ZERO, 0x12)); // scan bound
     a.op(m::addiu(T5, ZERO, u16::from(FIREBALL_BYTE)));
-    a.op(m::addiu(T6, ZERO, u16::from(PLAIN_UP_ALIAS)));
+    a.op(m::addiu(T6, ZERO, u16::from(plain_up)));
     a.bind(scan);
     a.op(m::lbu(T1, T0, 0));
     a.op(m::addiu(T2, ZERO, 0x19)); // (load-delay filler)
@@ -268,11 +273,11 @@ pub fn assemble_snap() -> Vec<u8> {
 
 /// Write the stubs and redirect the two range calls. Returns `false` when
 /// everything is already in place.
-pub fn install(patcher: &mut DiscPatcher, constants: &[u8]) -> Result<bool> {
+pub fn install(patcher: &mut DiscPatcher, constants: &[u8], plain_up: u8) -> Result<bool> {
     if constants.is_empty() {
         bail!("direct cast needs at least one cast art");
     }
-    let begin = assemble_begin(table_va());
+    let begin = assemble_begin(table_va(), plain_up);
     if SCUS_GAP_VA + begin.len() as u32 > SCUS_GAP_END_VA {
         bail!("direct-cast stub does not fit the SCUS gap");
     }
@@ -351,7 +356,7 @@ mod tests {
 
     fn begin(seat: u32, queue: &[u8], range: u32) -> (u32, Vec<u8>) {
         let mut cpu = Cpu::new();
-        cpu.load(SCUS_GAP_VA, &assemble_begin(table_va()));
+        cpu.load(SCUS_GAP_VA, &assemble_begin(table_va(), UP_MELEE_BYTE));
         cpu.load(table_va(), &table(&CASTS));
         cpu.load_words(
             RANGE_FN_VA,
@@ -384,14 +389,14 @@ mod tests {
     }
 
     #[test]
-    fn plain_up_plays_as_the_down_swing() {
+    fn plain_up_plays_as_the_up_melee_row() {
         let (v0, q) = begin(0, &[0x0F, 0x0C, 0x0F, 0x0D, 0], 900);
         assert_eq!(v0, 900, "range untouched");
-        assert_eq!(&q[..5], &[0x0E, 0x0C, 0x0E, 0x0D, 0]);
+        assert_eq!(&q[..5], &[0x0A, 0x0C, 0x0A, 0x0D, 0]);
         // other arts keep their shape, only the Up bytes change
         let (v0, q) = begin(0, &[0x0F, 0x19, 0x1F, 0], 900);
         assert_eq!(v0, 900);
-        assert_eq!(&q[..4], &[0x0E, 0x19, 0x1F, 0]);
+        assert_eq!(&q[..4], &[0x0A, 0x19, 0x1F, 0]);
     }
 
     #[test]
@@ -437,7 +442,7 @@ mod tests {
 
     #[test]
     fn stubs_fit_their_arenas() {
-        let image = assemble_begin(table_va());
+        let image = assemble_begin(table_va(), UP_MELEE_BYTE);
         assert!(SCUS_GAP_VA as usize + image.len() <= SCUS_GAP_END_VA as usize);
         assert!(table_va() as usize + TABLE_LEN <= ARENA1_END_VA as usize);
     }
@@ -455,7 +460,7 @@ mod dump {
         let dir = std::path::PathBuf::from(dir);
         std::fs::write(
             dir.join("begin.bin"),
-            super::assemble_begin(super::table_va()),
+            super::assemble_begin(super::table_va(), super::UP_MELEE_BYTE),
         )
         .unwrap();
         std::fs::write(dir.join("snap.bin"), super::assemble_snap()).unwrap();

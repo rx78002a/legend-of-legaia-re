@@ -327,6 +327,12 @@ pub fn default_clip_map(clips: &[BossClip]) -> Result<ClipMap> {
     })
 }
 
+/// record[0] action row that holds the High swing's melee clip when the
+/// fireball owns swing `0xF`. Retail leaves the row a header-only placeholder
+/// (the cast-module route stages it on a player caster the same way): a queue
+/// byte `0x0A` commits it through the party arm of the anim commit.
+pub const UP_MELEE_SLOT: usize = 0x0A;
+
 /// Frames between consecutive hits of a multi-hit art playing the fireball.
 const FIREBALL_HIT_GAP: usize = 2;
 /// `[count, start, end]` hold window the boss's own cast uses to charge.
@@ -492,6 +498,9 @@ pub struct BossPlan {
     /// The fireball clip, when direction swing `0xF` plays it (the charge
     /// hold is applied to that swing record).
     pub fireball_swing: Option<usize>,
+    /// Clip the host's record[0] action row [`UP_MELEE_SLOT`] plays as a
+    /// melee swing (the High swing the fireball took over), when set.
+    pub up_melee: Option<usize>,
 }
 
 fn power_hits(rec: &[u8]) -> usize {
@@ -614,6 +623,7 @@ pub fn plan_boss_with(
         base_entries,
         fireball: fireball_clip,
         fireball_swing: None,
+        up_melee: None,
     })
 }
 
@@ -649,6 +659,7 @@ pub fn rebuild_record0(
     plan: &BossPlan,
     rig: &PlayerRig,
     scale: f32,
+    up_melee: Option<&[u8]>,
 ) -> Result<(Vec<u8>, [usize; 3])> {
     let d = &rec0.decoded;
     let bank_off = rec0.word(BANK_WORD);
@@ -678,6 +689,9 @@ pub fn rebuild_record0(
         new_offs[slot] = out.len();
         let populated = rec0.stream_shape(slot).is_some_and(|(p, f)| p > 0 && f > 0);
         match plan.map.slots.get(&slot) {
+            _ if slot == UP_MELEE_SLOT && up_melee.is_some() => {
+                out.extend_from_slice(up_melee.unwrap());
+            }
             Some(&ci) if populated => {
                 let (parts, _) = rec0.stream_shape(slot).unwrap();
                 let e = inline_entry(
@@ -1108,6 +1122,7 @@ pub fn bossize_player_file(
     let warnings = geom.warnings.clone();
 
     let mut new_records: Vec<(u32, Vec<u8>)> = Vec::new();
+    let up_melee: std::cell::RefCell<Option<Vec<u8>>> = std::cell::RefCell::new(None);
     let mut section = 0usize;
     let mut anchor_section: Option<usize> = None;
     let mut max_body = [0usize; SECTION_COUNT];
@@ -1135,6 +1150,14 @@ pub fn bossize_player_file(
         let rewritten = replace_swings(&rewritten, |k, old| {
             let slot = swing_slot(section, k)?;
             let clip = plan.map.swings[slot - 0xC];
+            if slot == 0xF
+                && let Some(up) = plan.up_melee
+                && up_melee.borrow().is_none()
+            {
+                // The melee the fireball displaced, in the host's own swing
+                // shape (power run and rules from its retail High swing).
+                *up_melee.borrow_mut() = Some(swing_entry(old, &clips[up], rig, scale));
+            }
             let mut entry = swing_entry(old, &clips[clip], rig, scale);
             if plan.fireball_swing == Some(clip) {
                 let n = clips[clip].len();
@@ -1161,7 +1184,11 @@ pub fn bossize_player_file(
         bail!("descriptor chain closed after {section} sections");
     }
 
-    let (new_r0, hdr) = rebuild_record0(&rec0, clips, plan, rig, scale)?;
+    let up_melee = up_melee.into_inner();
+    if plan.up_melee.is_some() && up_melee.is_none() {
+        bail!("no High swing record found to template the Up melee row");
+    }
+    let (new_r0, hdr) = rebuild_record0(&rec0, clips, plan, rig, scale, up_melee.as_deref())?;
     let n_records = new_records.len();
     let mut file =
         rebuild_player_file_unbounded(player_file, pack.table_offset, pack.data_base, new_records)?;

@@ -25,7 +25,7 @@ fn check(p: &DiscPatcher) {
     // Somersault is bank row 23: constant 0x27.
     let scus = p.read_named_file("SCUS_942.54").expect("SCUS");
     let off = |va: u32| legaia_game_tables::item_names::file_offset_for_va(&scus, va).unwrap();
-    let begin = direct_cast::assemble_begin(direct_cast::table_va());
+    let begin = direct_cast::assemble_begin(direct_cast::table_va(), direct_cast::UP_MELEE_BYTE);
     assert_eq!(&scus[off(SCUS_GAP_VA)..][..begin.len()], begin.as_slice());
     let table_at = off(direct_cast::table_va());
     assert_eq!(scus[table_at + 0x27 - 0x10], 1, "Somersault is a cast art");
@@ -48,7 +48,7 @@ fn hook_lands_on_the_patched_image() {
     apply(&mut p, &Options::default()).expect("apply boss swap");
     check(&p);
     assert!(
-        !direct_cast::install(&mut p, &[0x27]).unwrap(),
+        !direct_cast::install(&mut p, &[0x27], direct_cast::UP_MELEE_BYTE).unwrap(),
         "second install is a no-op"
     );
 }
@@ -67,4 +67,50 @@ fn hooks_survive_the_ppf_round_trip() {
     legaia_disc_patch::ppf::apply_ppf3(&mut applied, &ppf).expect("apply ppf");
     assert!(applied == patched, "PPF reproduces the patched image");
     check(&DiscPatcher::open(applied).expect("open patched"));
+}
+
+/// Record[0] row `0x0A` carries the displaced Up melee: a real stream and a
+/// non-zero power run, where retail has a header-only placeholder.
+#[test]
+fn up_melee_row_is_authored() {
+    let Some(image) = disc() else { return };
+    let mut p = DiscPatcher::open(image).expect("open disc");
+    let retail = legaia_party_swap::playerize::boss::Record0::parse(
+        &p.read_entry_footprint(legaia_boss_swap::VAHN_ENTRY)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        retail.stream_shape(0x0A),
+        Some((0, 0)),
+        "retail placeholder"
+    );
+    apply(&mut p, &Options::default()).expect("apply boss swap");
+    let r0 = legaia_party_swap::playerize::boss::Record0::parse(
+        &p.read_entry_footprint(legaia_boss_swap::VAHN_ENTRY)
+            .unwrap(),
+    )
+    .unwrap();
+    let (parts, frames) = r0.stream_shape(0x0A).expect("row 0x0A");
+    assert!(parts > 0 && frames > 0, "row 0x0A has a stream");
+    let at = r0.entry_offset(0x0A).expect("row 0x0A offset");
+    assert!(
+        r0.decoded[at..at + 4].iter().any(|&b| b != 0),
+        "power run is set"
+    );
+    assert_ne!(r0.stream_shape(0x0A), r0.stream_shape(0x0B), "own clip");
+
+    // Off, the row stays the placeholder and a plain Up is the Down swing.
+    let mut q = DiscPatcher::open(disc().unwrap()).unwrap();
+    let opts = Options {
+        up_melee: false,
+        ..Options::default()
+    };
+    apply(&mut q, &opts).expect("apply without up melee");
+    let r0 = legaia_party_swap::playerize::boss::Record0::parse(
+        &q.read_entry_footprint(legaia_boss_swap::VAHN_ENTRY)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(r0.stream_shape(0x0A), Some((0, 0)));
 }

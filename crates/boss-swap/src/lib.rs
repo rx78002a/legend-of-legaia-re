@@ -40,6 +40,10 @@ pub struct Options {
     pub direct_cast: bool,
     /// Arts (by inline name) that cast the fireball when `direct_cast` is on.
     pub cast_arts: Vec<String>,
+    /// Keep the Up melee: the High swing the fireball displaced is authored
+    /// into record[0] row `0x0A` and a plain Up press plays it. Off, a plain
+    /// Up press plays the Down swing.
+    pub up_melee: bool,
     /// Mute the host character's own voice banks (arts shout, fanfares,
     /// swing grunt, victory barks).
     pub mute_host_voice: bool,
@@ -61,6 +65,7 @@ impl Default for Options {
             fireball_swing: true,
             direct_cast: true,
             cast_arts: vec!["Somersault".to_string()],
+            up_melee: true,
             mute_host_voice: true,
             calm_support: true,
             fireball_damage: true,
@@ -116,6 +121,7 @@ pub fn apply(patcher: &mut DiscPatcher, opts: &Options) -> Result<Report> {
         map.slots.insert(9, pose);
         map.spirit = Some(spirit);
     }
+    let up_melee_clip = map.swings[3];
     let swing_fireball = if opts.fireball_swing {
         let clip = boss::add_fireball_clip(&mut clips)?;
         map.swings[3] = clip;
@@ -126,6 +132,9 @@ pub fn apply(patcher: &mut DiscPatcher, opts: &Options) -> Result<Report> {
     let fb = fireball.zip(opts.fireball_art.as_deref());
     let mut plan = boss::plan_boss_with(&rec0, map, main_n, base_n, fb)?;
     plan.fireball_swing = swing_fireball;
+    if opts.fireball_swing && opts.direct_cast && opts.up_melee {
+        plan.up_melee = Some(up_melee_clip);
+    }
     report.notes.push(format!(
         "boss #{}: {} clips; art records: {}, main ME entries: {main_n}, base: {base_n}",
         opts.monster,
@@ -226,7 +235,12 @@ pub fn apply(patcher: &mut DiscPatcher, opts: &Options) -> Result<Report> {
                 .with_context(|| format!("no art record named {name:?}"))?;
             constants.push(direct_cast::TABLE_BASE + art.index as u8);
         }
-        let fresh = direct_cast::install(patcher, &constants)?;
+        let plain_up = if opts.up_melee {
+            direct_cast::UP_MELEE_BYTE
+        } else {
+            direct_cast::DOWN_SWING_BYTE
+        };
+        let fresh = direct_cast::install(patcher, &constants, plain_up)?;
         report.notes.push(format!(
             "direct cast hooks {}: art constants {constants:x?} collapse to the fireball swing",
             if fresh {
