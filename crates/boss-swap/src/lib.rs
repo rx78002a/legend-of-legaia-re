@@ -207,9 +207,19 @@ const MOVE_POWER_MAP: usize = 0x2664B;
 /// no retail record maps (party arts take no power from the table).
 const FIREBALL_MOVE_ID: usize = 0x0F;
 
-/// Map the fireball art's move id onto the boss's own special-attack record
-/// (the monster's first magic slot), so the clip's terminator installs it and
-/// its launch / contact effects spawn the projectile.
+/// Layout of the move-power table next to the id map.
+const MOVE_POWER_TABLE: usize = 0x26744;
+const MOVE_POWER_STRIDE: usize = 26;
+/// Move id `0x2C` (the unused "Freeze Thunder" enemy spell) owns record 22,
+/// which no monster reads: the fireball's own copy lives there.
+const SPARE_MOVE_ID: usize = 0x2C;
+
+/// Give the fireball art's move id a move-power record of its own: a copy of
+/// the boss's special-attack record (launch and contact effects, homing, cue)
+/// with the damage power zeroed. The clip's terminator installs it and the
+/// projectile spawns, while the art's own hit events do the damage; a kill by
+/// the projectile's damage path skips the victim's reaction pose and the
+/// enemy vanishes instead of collapsing.
 fn route_fireball_move(patcher: &mut DiscPatcher, monster: u16, report: &mut Report) -> Result<()> {
     let archive = patcher.read_entry_footprint(MONSTER_ARCHIVE_ENTRY)?;
     let block = legaia_actor_formats::monster_archive::decode_block(&archive, monster)?
@@ -225,13 +235,24 @@ fn route_fireball_move(patcher: &mut DiscPatcher, monster: u16, report: &mut Rep
     if map[FIREBALL_MOVE_ID] != 0 {
         bail!("move id {FIREBALL_MOVE_ID:#x} is already mapped to a power record");
     }
+    let spare = map[SPARE_MOVE_ID] as usize;
+    if spare == 0 {
+        bail!("spare move id {SPARE_MOVE_ID:#x} owns no record");
+    }
+    let record_at = |i: usize| MOVE_POWER_TABLE + i * MOVE_POWER_STRIDE;
+    let mut record = overlay
+        .get(record_at(map[spell] as usize)..record_at(map[spell] as usize + 1))
+        .context("battle overlay shorter than its move-power table")?
+        .to_vec();
+    record[..2].fill(0);
+    patcher.patch_prot_entry(BATTLE_OVERLAY_ENTRY, record_at(spare) as u64, &record)?;
     patcher.patch_prot_entry(
         BATTLE_OVERLAY_ENTRY,
         (MOVE_POWER_MAP + FIREBALL_MOVE_ID) as u64,
-        &[map[spell]],
+        &[spare as u8],
     )?;
     report.notes.push(format!(
-        "move id {FIREBALL_MOVE_ID:#x} -> move-power record {} (monster magic {spell:#x})",
+        "move id {FIREBALL_MOVE_ID:#x} -> move-power record {spare}: copy of record {} (monster magic {spell:#x}) with no damage power",
         map[spell]
     ));
     Ok(())

@@ -327,6 +327,10 @@ pub fn default_clip_map(clips: &[BossClip]) -> Result<ClipMap> {
 const FIREBALL_HIT_GAP: usize = 2;
 /// `[count, start, end]` hold window the boss's own cast uses to charge.
 const FIREBALL_LOOP: (u8, usize, usize) = (10, 10, 11);
+/// Power run of the fireball art: Vahn's own Hyper-art power bytes (Burning
+/// Flare), four hits. The projectile's move-power record carries no damage of
+/// its own (see `boss-swap`), so the art's hits are what damage and kill.
+const FIREBALL_POWER: [u8; 4] = [0x1D, 0x19, 0x1F, 0x1A];
 /// Inline name the fireball art is given (HUD banner).
 const FIREBALL_NAME: &str = "Hyper Wave";
 /// Main ME entry the fireball art streams from (the first spare stub).
@@ -355,7 +359,8 @@ pub fn add_fireball_clip(clips: &mut Vec<BossClip>) -> Result<usize> {
 /// Fireball timing for an art record entry: `hits` beats from the release
 /// frame, and the boss's charge hold.
 fn fireball_timing(entry: &mut [u8], clip: &BossClip, hits: usize, n: usize) {
-    let first = clip.events().first().copied().unwrap_or(1) as usize;
+    // The hits land after the projectile is away.
+    let first = clip.events().first().copied().unwrap_or(1) as usize + FIREBALL_HIT_GAP;
     entry[0x10..0x14].fill(0);
     for i in 0..hits.min(4) {
         entry[0x10 + i] = (first + i * FIREBALL_HIT_GAP).min(n.saturating_sub(1)) as u8;
@@ -664,7 +669,8 @@ pub fn rebuild_record0(
             apply_clip_head(entry, clip, n, Kind::Attack);
             clamp_loop(entry, n);
             if a.fireball {
-                fireball_timing(entry, clip, a.hits.max(1), n);
+                entry[..4].copy_from_slice(&FIREBALL_POWER);
+                fireball_timing(entry, clip, FIREBALL_POWER.len(), n);
             }
         }
     }
