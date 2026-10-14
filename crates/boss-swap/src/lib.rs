@@ -27,15 +27,19 @@ pub struct Options {
     /// Uniform scale applied to the boss geometry and pose translations.
     pub scale: f32,
     /// The art record (by inline name) that plays the boss's cast - its
-    /// fireball - instead of a melee move. `None` keeps melee in every art.
+    /// fireball - instead of a melee move (stage 1: the art walks up first).
+    /// `None` keeps melee in every art.
     pub fireball_art: Option<String>,
-    /// Direction swing `0xF` (Up) plays the boss's cast instead of a melee
-    /// move: the fireball is one D-pad press. A stage-1 variant that needs
-    /// `direct_cast` off (the hooks key on art constants, not swings).
+    /// Direction swing `0xF` plays the boss's cast: the fireball's clip lives
+    /// in that swing record and the move-power map points its queue byte at
+    /// the boss's spell record.
     pub fireball_swing: bool,
-    /// Stage 2 hooks ([`direct_cast`]): the cast art plays in place with no
-    /// walk-up, no leading arrows or swings, and its own spell's power.
+    /// Stage 2 hooks ([`direct_cast`]): the arts named in `cast_arts` collapse
+    /// to the fireball swing and play in place; a plain Up press plays the
+    /// Down swing so the fireball stays a technique.
     pub direct_cast: bool,
+    /// Arts (by inline name) that cast the fireball when `direct_cast` is on.
+    pub cast_arts: Vec<String>,
     /// Mute the host character's own voice banks (arts shout, fanfares,
     /// swing grunt, victory barks).
     pub mute_host_voice: bool,
@@ -53,9 +57,10 @@ impl Default for Options {
         Self {
             monster: 76,
             scale: 0.8,
-            fireball_art: Some("Somersault".to_string()),
-            fireball_swing: false,
+            fireball_art: None,
+            fireball_swing: true,
             direct_cast: true,
+            cast_arts: vec!["Somersault".to_string()],
             mute_host_voice: true,
             calm_support: true,
             fireball_damage: true,
@@ -121,28 +126,6 @@ pub fn apply(patcher: &mut DiscPatcher, opts: &Options) -> Result<Report> {
     let fb = fireball.zip(opts.fireball_art.as_deref());
     let mut plan = boss::plan_boss_with(&rec0, map, main_n, base_n, fb)?;
     plan.fireball_swing = swing_fireball;
-    if opts.fireball_swing && opts.direct_cast {
-        bail!(
-            "--fireball-swing needs --no-direct-cast: the direct-cast hooks key on art constants"
-        );
-    }
-    if opts.direct_cast
-        && let Some((pose, _)) = calm
-    {
-        // The art starter (queue byte 0x19 / 0x1A) plays the boss idle: the
-        // walk it played would carry the host forward before a cast.
-        let slot = STARTER_ENTRY;
-        if main_n > slot {
-            plan.main_entries[slot] = boss::MainEntry::Clip(pose);
-            for a in plan
-                .arts
-                .iter_mut()
-                .filter(|a| !a.base && a.name == "Starter")
-            {
-                a.new_source = slot;
-            }
-        }
-    }
     report.notes.push(format!(
         "boss #{}: {} clips; art records: {}, main ME entries: {main_n}, base: {base_n}",
         opts.monster,
@@ -227,27 +210,25 @@ pub fn apply(patcher: &mut DiscPatcher, opts: &Options) -> Result<Report> {
         (base_slot * winpose::READEF_SLOT) as u64,
         &arch.base,
     )?;
-    let cast_id = if opts.fireball_art.is_some() || opts.fireball_swing {
-        Some(route_fireball_move(
-            patcher,
-            opts.monster,
-            opts.fireball_damage,
-            !opts.direct_cast,
-            &mut report,
-        )?)
-    } else {
-        None
-    };
-    if opts.direct_cast
-        && let (Some(spell), Some(art)) = (
-            cast_id,
-            plan.arts.iter().find(|a| a.fireball).map(|a| a.index),
-        )
-    {
-        let constant = direct_cast::TABLE_BASE + art as u8;
-        let fresh = direct_cast::install(patcher, &[direct_cast::CastArt { constant, spell }])?;
+    if opts.fireball_art.is_some() || opts.fireball_swing {
+        route_fireball_move(patcher, opts.monster, opts.fireball_damage, &mut report)?;
+    }
+    if opts.direct_cast {
+        if !opts.fireball_swing {
+            bail!("direct cast collapses arts onto the fireball swing: it needs fireball_swing");
+        }
+        let mut constants = Vec::new();
+        for name in &opts.cast_arts {
+            let art = plan
+                .arts
+                .iter()
+                .find(|a| !a.base && a.name.eq_ignore_ascii_case(name))
+                .with_context(|| format!("no art record named {name:?}"))?;
+            constants.push(direct_cast::TABLE_BASE + art.index as u8);
+        }
+        let fresh = direct_cast::install(patcher, &constants)?;
         report.notes.push(format!(
-            "direct cast hooks {}: art constant {constant:#x} casts spell {spell:#x} in place",
+            "direct cast hooks {}: art constants {constants:x?} collapse to the fireball swing",
             if fresh {
                 "installed"
             } else {
@@ -260,10 +241,6 @@ pub fn apply(patcher: &mut DiscPatcher, opts: &Options) -> Result<Report> {
     }
     Ok(report)
 }
-
-/// Main ME entry the art starters stream from when the cast hooks are on
-/// (the first stub past the fireball and multi-hit entries).
-const STARTER_ENTRY: usize = 8;
 
 /// Vahn's voice lives in CD-XA files, not in the battle file: the arts shout
 /// bank, the Hyper / Super fanfare and Seru-magic fanfare banks, the swing
@@ -302,27 +279,18 @@ const MOVE_POWER_STRIDE: usize = 26;
 /// which no monster reads: the fireball's own copy lives there.
 const SPARE_MOVE_ID: usize = 0x2C;
 
-/// Settle which move-power record the fireball plays and return the move id
-/// that selects it.
-///
-/// With the direct-cast hooks the move id is a spell id the id map already
-/// resolves: the boss's own magic, or - with `keep_damage` off - the spare id
-/// `0x2C`, whose record is overwritten with a copy of the boss's
-/// special-attack record (launch and contact effects, homing, cue) with the
-/// damage power zeroed. The clip's terminator installs it and the projectile
-/// spawns, while the art's own hit events do the damage; a kill by the
-/// projectile's damage path skips the victim's reaction pose and the enemy
-/// vanishes instead of collapsing.
-///
-/// Without the hooks (`map_swing_byte`) the record is reached through the
-/// queue head instead, so the High swing byte `0x0F` is mapped to it.
+/// Give the fireball art's move id a move-power record of its own: a copy of
+/// the boss's special-attack record (launch and contact effects, homing, cue)
+/// with the damage power zeroed. The clip's terminator installs it and the
+/// projectile spawns, while the art's own hit events do the damage; a kill by
+/// the projectile's damage path skips the victim's reaction pose and the
+/// enemy vanishes instead of collapsing.
 fn route_fireball_move(
     patcher: &mut DiscPatcher,
     monster: u16,
     keep_damage: bool,
-    map_swing_byte: bool,
     report: &mut Report,
-) -> Result<u8> {
+) -> Result<()> {
     let archive = patcher.read_entry_footprint(MONSTER_ARCHIVE_ENTRY)?;
     let block = legaia_actor_formats::monster_archive::decode_block(&archive, monster)?
         .context("empty monster slot")?;
@@ -334,26 +302,20 @@ fn route_fireball_move(
     if spell >= map.len() || map[spell] == 0 {
         bail!("monster magic id {spell:#x} has no move-power record to borrow");
     }
-    if map_swing_byte && map[FIREBALL_MOVE_ID] != 0 {
+    if map[FIREBALL_MOVE_ID] != 0 {
         bail!("move id {FIREBALL_MOVE_ID:#x} is already mapped to a power record");
     }
     if keep_damage {
         let id = map[spell];
-        if map_swing_byte {
-            patcher.patch_prot_entry(
-                BATTLE_OVERLAY_ENTRY,
-                (MOVE_POWER_MAP + FIREBALL_MOVE_ID) as u64,
-                &[id],
-            )?;
-            report.notes.push(format!(
-                "move id {FIREBALL_MOVE_ID:#x} -> move-power record {id} (monster magic {spell:#x})"
-            ));
-        } else {
-            report.notes.push(format!(
-                "cast spell {spell:#x} -> move-power record {id} (the boss's own)"
-            ));
-        }
-        return Ok(spell as u8);
+        patcher.patch_prot_entry(
+            BATTLE_OVERLAY_ENTRY,
+            (MOVE_POWER_MAP + FIREBALL_MOVE_ID) as u64,
+            &[id],
+        )?;
+        report.notes.push(format!(
+            "move id {FIREBALL_MOVE_ID:#x} -> move-power record {id} (monster magic {spell:#x})"
+        ));
+        return Ok(());
     }
     let spare = map[SPARE_MOVE_ID] as usize;
     if spare == 0 {
@@ -366,20 +328,14 @@ fn route_fireball_move(
         .to_vec();
     record[..2].fill(0);
     patcher.patch_prot_entry(BATTLE_OVERLAY_ENTRY, record_at(spare) as u64, &record)?;
-    if map_swing_byte {
-        patcher.patch_prot_entry(
-            BATTLE_OVERLAY_ENTRY,
-            (MOVE_POWER_MAP + FIREBALL_MOVE_ID) as u64,
-            &[spare as u8],
-        )?;
-    }
+    patcher.patch_prot_entry(
+        BATTLE_OVERLAY_ENTRY,
+        (MOVE_POWER_MAP + FIREBALL_MOVE_ID) as u64,
+        &[spare as u8],
+    )?;
     report.notes.push(format!(
-        "fireball -> move-power record {spare}: copy of record {} (monster magic {spell:#x}) with no damage power",
+        "move id {FIREBALL_MOVE_ID:#x} -> move-power record {spare}: copy of record {} (monster magic {spell:#x}) with no damage power",
         map[spell]
     ));
-    Ok(if map_swing_byte {
-        FIREBALL_MOVE_ID as u8
-    } else {
-        SPARE_MOVE_ID as u8
-    })
+    Ok(())
 }
