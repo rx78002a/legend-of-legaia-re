@@ -5,7 +5,7 @@ use legaia_disc_patch::ppf;
 
 fn usage() -> ! {
     eprintln!(
-        "usage: boss-swap build <disc.bin|.cue> <out.ppf> [--monster N] [--scale F] [--no-fireball] [--fireball-art NAME] [--keep-voices] [--keep-support-anims] [--free-fireball]\n       \
+        "usage: boss-swap build <disc.bin|.cue> <out.ppf> [--monster N] [--scale F] [--no-fireball] [--fireball-art NAME] [--no-direct-cast] [--fireball-swing] [--keep-voices] [--keep-support-anims] [--free-fireball]\n       \
          (writes a PPF 3.0 patch; the disc image is never modified)"
     );
     std::process::exit(2);
@@ -38,11 +38,22 @@ fn main() -> Result<()> {
             }
             "--no-fireball" => {
                 opts.fireball_art = None;
+                opts.fireball_swing = false;
                 i += 1;
             }
             "--fireball-art" => {
                 opts.fireball_art = Some(args.get(i + 1).context("--fireball-art NAME")?.clone());
+                opts.fireball_swing = false;
                 i += 2;
+            }
+            "--no-direct-cast" => {
+                opts.direct_cast = false;
+                i += 1;
+            }
+            "--fireball-swing" => {
+                opts.fireball_swing = true;
+                opts.fireball_art = None;
+                i += 1;
             }
             "--keep-voices" => {
                 opts.mute_host_voice = false;
@@ -122,11 +133,22 @@ fn render(args: &[String]) -> Result<()> {
             }
             "--no-fireball" => {
                 opts.fireball_art = None;
+                opts.fireball_swing = false;
                 i += 1;
             }
             "--fireball-art" => {
                 opts.fireball_art = Some(args.get(i + 1).context("--fireball-art NAME")?.clone());
+                opts.fireball_swing = false;
                 i += 2;
+            }
+            "--no-direct-cast" => {
+                opts.direct_cast = false;
+                i += 1;
+            }
+            "--fireball-swing" => {
+                opts.fireball_swing = true;
+                opts.fireball_art = None;
+                i += 1;
             }
             "--keep-voices" => {
                 opts.mute_host_voice = false;

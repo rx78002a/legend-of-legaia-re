@@ -15,7 +15,9 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 legaia-actor-formats.workspace = true
+legaia-code-hooks.workspace = true
 legaia-disc-patch.workspace = true
+legaia-game-tables.workspace = true
 legaia-iso.workspace = true
 legaia-tim.workspace = true
 legaia-tmd.workspace = true

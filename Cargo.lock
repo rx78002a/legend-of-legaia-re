@@ -1329,7 +1329,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "legaia-actor-formats",
+ "legaia-code-hooks",
  "legaia-disc-patch",
+ "legaia-game-tables",
  "legaia-iso",
  "legaia-party-swap",
  "legaia-tim",

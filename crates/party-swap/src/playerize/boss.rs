@@ -489,6 +489,9 @@ pub struct BossPlan {
     pub base_entries: usize,
     /// The fireball clip, when an art plays it.
     pub fireball: Option<usize>,
+    /// The fireball clip, when direction swing `0xF` plays it (the charge
+    /// hold is applied to that swing record).
+    pub fireball_swing: Option<usize>,
 }
 
 fn power_hits(rec: &[u8]) -> usize {
@@ -610,6 +613,7 @@ pub fn plan_boss_with(
         main_entries: main,
         base_entries,
         fireball: fireball_clip,
+        fireball_swing: None,
     })
 }
 
@@ -1130,12 +1134,19 @@ pub fn bossize_player_file(
         .with_context(|| format!("rewrite record {idx} (id {:#x})", rec.id))?;
         let rewritten = replace_swings(&rewritten, |k, old| {
             let slot = swing_slot(section, k)?;
-            Some(swing_entry(
-                old,
-                &clips[plan.map.swings[slot - 0xC]],
-                rig,
-                scale,
-            ))
+            let clip = plan.map.swings[slot - 0xC];
+            let mut entry = swing_entry(old, &clips[clip], rig, scale);
+            if plan.fireball_swing == Some(clip) {
+                let n = clips[clip].len();
+                set_loop(
+                    &mut entry,
+                    FIREBALL_LOOP.0,
+                    FIREBALL_LOOP.1,
+                    FIREBALL_LOOP.2,
+                );
+                clamp_loop(&mut entry, n);
+            }
+            Some(entry)
         })
         .with_context(|| format!("swap swing records of record {idx}"))?;
         max_body[section] =
