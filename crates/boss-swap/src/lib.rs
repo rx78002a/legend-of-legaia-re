@@ -441,10 +441,7 @@ fn map_idle(plan: &boss::BossPlan) -> usize {
 /// is in its record (the other forms list the rest).
 fn borrowed_spells(monster: u16) -> &'static [u8] {
     match monster {
-        180 => &[
-            module_cast::SPELL_MYSTIC_CIRCLE,
-            module_cast::SPELL_MYSTIC_SHIELD,
-        ],
+        180 => &[module_cast::SPELL_MYSTIC_CIRCLE],
         _ => &[],
     }
 }

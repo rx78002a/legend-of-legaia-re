@@ -209,14 +209,14 @@ fn cort_first_form_routes_guilty_cross() {
     );
     // Mystic Circle rides Hyper Elbow with its one pose in the pool
     assert_eq!(scus[off(l.table) + 0x29 - 0x10], 0xB7);
-    assert_eq!(scus[at + 4], 0xAC, "slot 1 routes Mystic Shield");
+    assert_eq!(scus[at + 4], 0xB7, "slot 1 routes Mystic Circle");
+    let pooled = u16::from_le_bytes(scus[at + 6..at + 8].try_into().unwrap()) as usize;
+    let guard = module_cast::assemble_mc_guard();
     assert_eq!(
-        &scus[at + 6..at + 8],
-        &[0, 0],
-        "the shield has no pooled pose"
+        &scus[off(l.guard_938)..][..guard.len()],
+        guard.as_slice(),
+        "voice guard"
     );
-    assert_eq!(scus[at + 8], 0xB7, "slot 2 routes Mystic Circle");
-    let pooled = u16::from_le_bytes(scus[at + 10..at + 12].try_into().unwrap()) as usize;
     assert!(pooled != 0, "Mystic Circle has a pooled pose");
     // a hit on a monster special requests Cort's readef group (3 * 18)
     assert_eq!(scus[off(l.readef)], 0x36);
@@ -325,6 +325,7 @@ fn cort_first_form_routes_mystic_shield() {
         &mut p,
         &Options {
             monster: 180,
+            specials: vec![(0x27, 0x37), (0x26, 0xAC), (0x29, 0xB7)],
             ..Options::default()
         },
     )

@@ -166,6 +166,8 @@ pub struct Layout {
     pub shield_pass: u32,
     /// The shield owner's seat (one byte; ARENA2).
     pub owner: u32,
+    /// Mystic Circle's phase-0 guard (waits for the texture stream).
+    pub guard_938: u32,
 }
 
 pub fn layout() -> Layout {
@@ -181,6 +183,7 @@ pub fn layout() -> Layout {
         shield_caster: HOOK_VA + 0x120,
         shield_pass: HOOK_VA + 0x150,
         owner: ARENA2_VA + 0x45,
+        guard_938: HOOK_VA + 0x1A0,
     }
 }
 
@@ -543,6 +546,39 @@ pub fn edits_940() -> Vec<ModuleEdit> {
     ]
 }
 
+/// The voice cue call of Mystic Circle's phase 0 (`jal FUN_8004FCC8(0x1AC)`).
+const CUE_FN_VA: u32 = 0x8004_FCC8;
+const MC_CUE_SITE_VA: u32 = 0x801F_6AA4;
+const MC_CUE_RESUME_VA: u32 = 0x801F_6AAC;
+const MC_EPILOGUE_VA: u32 = 0x801F_7240;
+const MC_CUE_ID: u16 = 0x1AC;
+
+/// A cast whose texture group was requested from the route stub starts while
+/// the stream is still reading the CD, and the opening voice cue (CD-XA on the
+/// same drive) dies with it. Mystic Circle's phase 0 begins with that cue, so
+/// it waits (the tick returns "busy" and phase 0 runs again next frame) until
+/// the streaming applier (`ctx[+0x276]`) is idle. Entered by a `j` that
+/// replaces the cue's `jal` (the delay slot is the original `addiu a0`).
+pub fn assemble_mc_guard() -> Vec<u8> {
+    let mut a = Asm::new();
+    let wait = a.label();
+    a.op(m::lui(T0, 0x8008));
+    a.op(m::lw(T0, T0, 0xBD24)); // ctx
+    a.op(m::nop());
+    a.op(m::lbu(T0, T0, 0x276)); // applier stage
+    a.op(m::nop());
+    a.br(wait, move |o| m::bne(T0, ZERO, o));
+    a.op(m::nop());
+    a.op(m::jal(CUE_FN_VA));
+    a.op(m::addiu(A0, ZERO, MC_CUE_ID));
+    a.op(m::j(MC_CUE_RESUME_VA));
+    a.op(m::nop());
+    a.bind(wait);
+    a.op(m::j(MC_EPILOGUE_VA));
+    a.op(m::nop());
+    words_to_bytes(a.finish())
+}
+
 /// One expect-verified word edit inside a module image.
 #[derive(Debug, Clone, Copy)]
 pub struct ModuleEdit {
@@ -717,7 +753,10 @@ pub fn edits_938() -> Vec<ModuleEdit> {
             ed(tail + 8, load_count, m::nop()),
         ]
     };
-    let mut v = vec![ed(0x801F_6CC8, 0x2402_0007, stage_imm(STAGE_ROW_B))];
+    let mut v = vec![
+        ed(0x801F_6CC8, 0x2402_0007, stage_imm(STAGE_ROW_B)),
+        ed(MC_CUE_SITE_VA, m::jal(CUE_FN_VA), m::j(layout().guard_938)),
+    ];
     v.extend(sweep(A0, 0x801F_6BA4, 0x801F_6BBC, 0x801F_6BDC)); // phase 0 hide
     v.extend(sweep(A0, 0x801F_6C04, 0x801F_6C20, 0x801F_6C40)); // phase 1 hide
     v.extend(sweep(A1, 0x801F_6ED8, 0x801F_6EF8, 0x801F_6F18)); // phase 2 show
@@ -901,6 +940,9 @@ pub fn install(
         }
         changed |= write_scus(patcher, l.hook, &hook)?;
         changed |= write_scus(patcher, l.readef, &[readef_base])?;
+    }
+    if readef_base != 0 && specials.iter().any(|s| s.spell == SPELL_MYSTIC_CIRCLE) {
+        changed |= write_scus(patcher, l.guard_938, &assemble_mc_guard())?;
     }
     if specials.iter().any(|s| s.spell == SPELL_MYSTIC_SHIELD) {
         for (va, code) in [
@@ -1240,6 +1282,23 @@ mod tests {
         assert_eq!(cpu.r[V0 as usize], 0x8012_9999);
     }
 
+    #[test]
+    fn mystic_circle_waits_for_the_stream_before_its_voice() {
+        for (stage, resumed) in [(0u8, true), (1, false), (4, false)] {
+            let mut cpu = Cpu::new();
+            let l = layout();
+            cpu.load(l.guard_938, &assemble_mc_guard());
+            cpu.load_words(CUE_FN_VA, &[m::jr(RA), m::nop()]);
+            cpu.wr32(CTX_PTR_VA, CTX);
+            cpu.wr8(CTX + 0x276, stage);
+            cpu.r[RA as usize] = RETURN_VA;
+            cpu.pc = l.guard_938;
+            let at = cpu.run_until(&[MC_CUE_RESUME_VA, MC_EPILOGUE_VA]);
+            assert_eq!(at == MC_CUE_RESUME_VA, resumed, "stage {stage}");
+            assert_eq!(cpu.r[A0 as usize] == u32::from(MC_CUE_ID), resumed);
+        }
+    }
+
     fn words(b: &[u8]) -> Vec<u32> {
         b.chunks(4)
             .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
@@ -1257,6 +1316,7 @@ mod tests {
             assemble_shield_store(&l),
             assemble_shield_caster(),
             assemble_shield_pass(&l),
+            assemble_mc_guard(),
         ] {
             assert!(crate::hazard::load_hazards(&words(&code)).is_empty());
         }
