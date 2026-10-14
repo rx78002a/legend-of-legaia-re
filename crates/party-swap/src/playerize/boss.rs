@@ -141,6 +141,20 @@ impl BossClip {
 
 /// Every populated clip of monster `id`, in entry-table order.
 pub fn boss_clips(archive: &[u8], id: u16) -> Result<Vec<BossClip>> {
+    let mut clips = boss_clips_raw(archive, id)?;
+    let mesh = monster_archive::mesh(archive, id)?
+        .ok_or_else(|| anyhow::anyhow!("monster id {id}: empty slot"))?;
+    let tmd = legaia_tmd::parse(mesh.tmd_bytes()).context("boss TMD")?;
+    let objects = decode_model(&tmd, mesh.tmd_bytes())?;
+    let fit = super::part_fit::plan(&objects, &clips);
+    if !fit.is_identity(objects.len()) {
+        super::part_fit::fit_clips(&mut clips, &fit);
+    }
+    Ok(clips)
+}
+
+/// The clips as authored: one pose per part of the monster's own mesh.
+pub fn boss_clips_raw(archive: &[u8], id: u16) -> Result<Vec<BossClip>> {
     let block = monster_archive::decode_block(archive, id)?
         .ok_or_else(|| anyhow::anyhow!("monster id {id}: empty slot"))?;
     let n = *block.get(0x4A).context("monster record too short")? as usize;
@@ -380,17 +394,27 @@ pub fn default_clip_map(clips: &[BossClip]) -> Result<ClipMap> {
         (5, 5),
         (0xB, 0xB),
     ] {
-        // A boss that never blocks plays its idle for the host's Block.
+        // A boss that never blocks plays its idle for the host's Block; one
+        // without a second flinch, a knockdown or a get-up plays the nearest
+        // reaction it has (retail falls back the same way for a monster with
+        // no knockdown: it reuses its light flinch).
         let ci = match find_tag(clips, tag) {
             Some(ci) => ci,
             None if tag == 0xB => idle,
+            None if tag == 3 => need(2)?,
+            None if tag == 4 => find_tag(clips, 3).map_or_else(|| need(2), Ok)?,
+            None if tag == 5 => idle,
             None => need(tag)?,
         };
         slots.insert(slot, ci);
     }
     slots.insert(7, idle);
     slots.insert(8, idle);
-    slots.insert(9, need(4)?);
+    slots.insert(
+        9,
+        find_tag(clips, 4)
+            .map_or_else(|| find_tag(clips, 2).context("boss has no flinch clip"), Ok)?,
+    );
     // Melee moves, best fit first: the tag-0x0E single-hit moves, then any
     // other single-hit attack, then the multi-hit attacks; cycled to four.
     let attack = |c: &BossClip| (0x0C..=0x1F).contains(&c.tag) && !c.events().is_empty();
@@ -1304,10 +1328,21 @@ pub fn boss_geometry(
     let tmd = legaia_tmd::parse(mesh.tmd_bytes()).context("boss TMD")?;
     let mut objects = decode_model(&tmd, mesh.tmd_bytes())?;
     if objects.len() != CANONICAL_PARTS {
-        bail!(
-            "monster id {id} has {} parts, need {CANONICAL_PARTS}",
-            objects.len()
-        );
+        let raw = boss_clips_raw(archive, id)?;
+        let fit = super::part_fit::plan(&objects, &raw);
+        warnings.push(format!(
+            "monster id {id} has {} parts, the rig has {CANONICAL_PARTS}: {}",
+            objects.len(),
+            if fit.merges.is_empty() {
+                "padded with empty parts".to_string()
+            } else {
+                format!(
+                    "{} parts merged into the ones they follow",
+                    fit.merges.len()
+                )
+            }
+        ));
+        objects = super::part_fit::fit_objects(objects, &fit, &raw);
     }
     let pool = mesh
         .texture_pool_bytes()

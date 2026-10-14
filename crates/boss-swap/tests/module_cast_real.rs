@@ -413,3 +413,55 @@ fn cort_first_form_routes_evil_seru_magic() {
     let dummy = module_cast::assemble_esm_dummy(&l);
     assert_eq!(&scus[off(l.esm_dummy)..][..dummy.len()], dummy.as_slice());
 }
+
+/// Songi's third form: 18 parts merged onto the 15-channel rig, Chaos Flare
+/// routed into PROT 951 with every edit landing on its expected word.
+#[test]
+fn songi_third_form_routes_chaos_flare() {
+    let Some(image) = disc() else { return };
+    let mut p = DiscPatcher::open(image).expect("open disc");
+    let report = apply(
+        &mut p,
+        &Options {
+            monster: 179,
+            ..Options::default()
+        },
+    )
+    .expect("apply boss swap");
+    assert!(
+        report.notes.iter().any(|n| n.contains("3 parts merged")),
+        "{:?}",
+        report.notes
+    );
+    let l = module_cast::layout();
+    let scus = p.read_named_file("SCUS_942.54").unwrap();
+    let off = |va: u32| legaia_game_tables::item_names::file_offset_for_va(&scus, va).unwrap();
+    assert_eq!(scus[off(l.table) + 0x27 - 0x10], 0x36);
+    // Songi's flame texture bank: readef group 22
+    assert_eq!(scus[off(l.readef)], 66);
+    assert_eq!(&scus[off(l.rows)..][..2], &[0x36, 1], "needs the group");
+    let m951 = p.read_entry(951).unwrap();
+    let edits = module_cast::edits_951();
+    for e in &edits {
+        assert_eq!(word(&m951, e.va), e.replace, "951 {:#x}", e.va);
+    }
+    let ws: Vec<u32> = m951
+        .chunks(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for e in &edits {
+        let i = ((e.va - 0x801F_69D8) / 4) as usize;
+        let lo = i.saturating_sub(1);
+        let hi = (i + 3).min(ws.len());
+        for h in legaia_boss_swap::hazard::load_hazards(&ws[lo..hi]) {
+            let at = lo + h;
+            assert!(
+                !(at == i || at + 1 == i),
+                "load-delay hazard at {:#x}",
+                0x801F_69D8 + at as u32 * 4
+            );
+        }
+    }
+    let guard = module_cast::assemble_cf_guard();
+    assert_eq!(&scus[off(l.guard_951)..][..guard.len()], guard.as_slice());
+}

@@ -125,3 +125,25 @@ fn untextured_counts() {
         );
     }
 }
+
+#[test]
+#[ignore]
+fn part_counts() {
+    let Some(path) = std::env::var_os("LEGAIA_DISC_BIN") else {
+        return;
+    };
+    let p = DiscPatcher::open(std::fs::read(path).unwrap()).unwrap();
+    let archive = p.read_entry_footprint(867).unwrap();
+    let mut by: std::collections::BTreeMap<usize, Vec<u16>> = Default::default();
+    for id in 1u16..=194 {
+        let Ok(Some(mesh)) = monster_archive::mesh(&archive, id) else {
+            continue;
+        };
+        if let Ok(tmd) = legaia_tmd::parse(mesh.tmd_bytes()) {
+            by.entry(tmd.objects.len()).or_default().push(id);
+        }
+    }
+    for (n, ids) in by {
+        println!("{n:3} parts: {} monsters {:?}", ids.len(), ids);
+    }
+}

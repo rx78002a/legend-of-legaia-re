@@ -408,7 +408,10 @@ fn apply_with(
             .collect();
         // Monster specials stream their texture page with the boss's own readef
         // group (record `+0x1C`); the host's turn would stream its own.
-        let readef_base = if module_specials.iter().any(|s| s.spell >= 0xA1) {
+        let readef_base = if module_specials
+            .iter()
+            .any(|s| module_cast::needs_group(s.spell))
+        {
             let block =
                 legaia_actor_formats::monster_archive::decode_block(&archive, opts.monster)?
                     .context("empty monster slot")?;

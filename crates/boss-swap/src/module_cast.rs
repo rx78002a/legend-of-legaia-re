@@ -90,12 +90,24 @@ pub const SPELL_MYSTIC_CIRCLE: u8 = 0xB7;
 pub const SPELL_MYSTIC_SHIELD: u8 = 0xAC;
 /// Cort's Evil Seru Magic (PROT 966, tick body `0x801F6A74`).
 pub const SPELL_EVIL_SERU: u8 = 0xAD;
+/// Songi's third form: Chaos Flare (PROT 951, tick body `0x801F6A20`).
+pub const SPELL_CHAOS_FLARE: u8 = 0x36;
+
+/// Specials whose effects draw from the texture bank of the boss's own readef
+/// group (Cort's rune circle, the Juggernaut and the shield; Songi's flame):
+/// a cast of one asks for that group (see [`assemble_readef_request`]).
+pub fn needs_group(spell: u8) -> bool {
+    matches!(
+        spell,
+        SPELL_MYSTIC_CIRCLE | SPELL_MYSTIC_SHIELD | SPELL_EVIL_SERU | SPELL_CHAOS_FLARE
+    )
+}
 
 /// The art each spell is routed onto by default (`--special` overrides):
 /// Somersault, Hyper Elbow and Slash Kick.
 pub fn default_constant(spell: u8) -> Option<u8> {
     match spell {
-        SPELL_HYPER_CRUSH | SPELL_GUILTY_CROSS => Some(0x27),
+        SPELL_HYPER_CRUSH | SPELL_GUILTY_CROSS | SPELL_CHAOS_FLARE => Some(0x27),
         SPELL_HYPER_LIGHTNING | SPELL_MYSTIC_CIRCLE => Some(0x29),
         SPELL_MYSTIC_SHIELD => Some(0x26),
         SPELL_EVIL_SERU => Some(0x28),
@@ -103,7 +115,8 @@ pub fn default_constant(spell: u8) -> Option<u8> {
     }
 }
 /// The row table holds up to `ROW_SLOTS` routed spells, four bytes each:
-/// `[spell, 0, pool entry offset (u16)]`, an empty slot has spell `0`.
+/// `[spell, needs the boss's texture group, pool entry offset (u16)]`, an
+/// empty slot has spell `0`.
 pub const ROW_SLOTS: usize = 4;
 
 /// One art routed into a cast module.
@@ -135,6 +148,9 @@ pub fn stage_entries(spell: u8) -> Option<StageEntries> {
         SPELL_HYPER_CRUSH => (Some(0x0D), Some(0x0B)),
         SPELL_HYPER_LIGHTNING => (Some(0x0D), Some(0x0C)),
         SPELL_GUILTY_CROSS => (Some(0x08), None),
+        // Chaos Flare stages raw row 8 too (Songi's third form owns its cast
+        // clip at entry 8, like Cort's Guilty Cross)
+        SPELL_CHAOS_FLARE => (Some(0x08), None),
         SPELL_MYSTIC_CIRCLE => (None, Some(0x07)),
         // the shield body stages no caster pose: the caster holds its idle
         SPELL_MYSTIC_SHIELD => (None, None),
@@ -176,6 +192,8 @@ pub struct Layout {
     pub guard_938: u32,
     /// Evil Seru Magic's phase-0 guard.
     pub guard_966: u32,
+    /// Chaos Flare's voice guard.
+    pub guard_951: u32,
     /// Evil Seru Magic's stand-in record[0] table (see [`assemble_esm_dummy`]).
     pub esm_dummy: u32,
 }
@@ -193,9 +211,10 @@ pub fn layout() -> Layout {
         shield_caster: HOOK_VA + 0x120,
         shield_pass: HOOK_VA + 0x150,
         owner: ARENA2_VA + 0x45,
-        guard_938: HOOK_VA + 0x1A0,
-        guard_966: HOOK_VA + 0x1E0,
-        esm_dummy: HOOK_VA + 0x220,
+        guard_938: HOOK_VA + 0x170,
+        guard_966: HOOK_VA + 0x1B0,
+        guard_951: HOOK_VA + 0x1F0,
+        esm_dummy: HOOK_VA + 0x230,
     }
 }
 
@@ -210,9 +229,6 @@ fn gp_off(k: u32) -> u16 {
 /// run, so this route and those exclude each other).
 pub const HOOK_VA: u32 = 0x8007_AB80;
 pub const HOOK_END_VA: u32 = 0x8007_AE00;
-/// Spells at or above this id are monster specials: no party cast streams a
-/// texture bank for them.
-const MONSTER_SPELL_MIN: u16 = 0xA1;
 
 fn table(specials: &[Special]) -> [u8; 0x24] {
     let mut t = [0u8; 0x24];
@@ -225,8 +241,9 @@ fn table(specials: &[Special]) -> [u8; 0x24] {
     t
 }
 
-/// The routed-spell table: every special gets a slot, with its pool entry
-/// offset from `pool` (`0` when it has none).
+/// The routed-spell table: every special gets a slot, with whether it needs
+/// the boss's texture group and its pool entry offset from `pool` (`0` when it
+/// has none).
 fn row_table(specials: &[Special], pool: &[(u8, usize)]) -> Result<[u8; ROW_SLOTS * 4]> {
     if specials.len() > ROW_SLOTS {
         bail!("at most {ROW_SLOTS} routed spells");
@@ -240,6 +257,7 @@ fn row_table(specials: &[Special], pool: &[(u8, usize)]) -> Result<[u8; ROW_SLOT
                 u16::try_from(off).context("pool entry offset past 16 bits")
             })?;
         t[i * 4] = s.spell;
+        t[i * 4 + 1] = u8::from(needs_group(s.spell));
         t[i * 4 + 2..i * 4 + 4].copy_from_slice(&off.to_le_bytes());
     }
     Ok(t)
@@ -407,26 +425,42 @@ pub fn assemble_prep(l: &Layout) -> Vec<u8> {
 
 /// The texture request of a routed monster special, jumped to from the route
 /// stub's hit path (`t3` = the spell id, the stub's frame still on the stack).
-/// A monster special's texture page streams with the boss's own readef group
-/// (Cort's Mystic Circle rune circle is slot 54 of group 18), but the host's
+/// A monster special's effects draw from the texture bank of the boss's own
+/// readef group (Cort's rune circle is slot 54 of group 18), but the host's
 /// turn streamed its character's group (Vahn's slot 0, the `BACK / READY` menu
 /// page). The queue builder runs at action-seed state `0x0C`, after state
 /// `0x0B` has waited the streaming applier (`ctx[+0x276]`) idle, so the
 /// request is safe to issue there: `ctx[+0x277]` = the group base and
 /// `ctx[+0x276] = 1` restart the applier, which streams the group's slots
-/// during the cast's own opening. A second builder pass sees the base already
-/// seeded and leaves the stream alone.
+/// during the cast's own opening. Only a spell whose row says it needs the
+/// group asks; a second builder pass sees the base already seeded and leaves
+/// the stream alone.
 pub fn assemble_readef_request(l: &Layout) -> Vec<u8> {
     let mut a = Asm::new();
-    let out = a.label();
+    let (out, scan, found) = (a.label(), a.label(), a.label());
     let readef_off = ((l.readef) as i64 - GP_VA as i64) as i16 as u16;
-    a.op(m::sltiu(T4, T3, MONSTER_SPELL_MIN)); // a party spell?
-    a.br(out, move |o| m::bne(T4, ZERO, o));
-    a.op(m::lbu(T5, GP, readef_off)); // delay: configured group base
-    a.op(m::lui(T6, m::hi(CTX_PTR_VA)));
-    a.op(m::lw(T6, T6, m::lo(CTX_PTR_VA))); // ctx
+    a.op(m::lui(T1, m::hi(l.rows)));
+    a.op(m::addiu(T1, T1, m::lo(l.rows)));
+    a.op(m::addiu(T2, ZERO, ROW_SLOTS as u16));
+    a.bind(scan);
+    a.op(m::lbu(T4, T1, 0)); // routed spell of this slot
+    a.op(m::addiu(T2, T2, 0xFFFF)); // (fills the lbu's load delay)
+    a.br(found, move |o| m::beq(T4, T3, o));
+    a.op(m::nop());
+    a.br(scan, move |o| m::bne(T2, ZERO, o));
+    a.op(m::addiu(T1, T1, 4)); // delay: next slot
+    a.br(out, move |o| m::beq(ZERO, ZERO, o)); // not routed
+    a.op(m::nop());
+    a.bind(found);
+    a.op(m::lbu(T4, T1, 1)); // does the spell need the group?
+    a.op(m::lbu(T5, GP, readef_off)); // configured group base
+    a.op(m::nop());
+    a.br(out, move |o| m::beq(T4, ZERO, o));
+    a.op(m::nop());
     a.br(out, move |o| m::beq(T5, ZERO, o)); // no group configured
-    a.op(m::addiu(T0, ZERO, 1)); // delay
+    a.op(m::lui(T6, m::hi(CTX_PTR_VA))); // delay
+    a.op(m::lw(T6, T6, m::lo(CTX_PTR_VA))); // ctx
+    a.op(m::addiu(T0, ZERO, 1));
     a.op(m::lbu(T7, T6, 0x277)); // the base now seeded
     a.op(m::nop());
     a.br(out, move |o| m::beq(T7, T5, o)); // already requested
@@ -569,6 +603,10 @@ const ESM_CUE_SITE_VA: u32 = 0x801F_6B1C;
 const ESM_CUE_RESUME_VA: u32 = 0x801F_6B24;
 const ESM_EPILOGUE_VA: u32 = 0x801F_8D34;
 const ESM_CUE_ID: u16 = 0x1AE;
+const CF_CUE_SITE_VA: u32 = 0x801F_6C60;
+const CF_CUE_RESUME_VA: u32 = 0x801F_6C68;
+const CF_EPILOGUE_VA: u32 = 0x801F_77B4;
+const CF_CUE_ID: u16 = 0x1B5;
 
 /// A cast whose texture group was requested from the route stub starts while
 /// the stream is still reading the CD, and the opening voice cue (CD-XA on the
@@ -600,6 +638,10 @@ pub fn assemble_mc_guard() -> Vec<u8> {
     assemble_cue_guard(MC_CUE_ID, MC_CUE_RESUME_VA, MC_EPILOGUE_VA)
 }
 
+pub fn assemble_cf_guard() -> Vec<u8> {
+    assemble_cue_guard(CF_CUE_ID, CF_CUE_RESUME_VA, CF_EPILOGUE_VA)
+}
+
 pub fn assemble_esm_guard() -> Vec<u8> {
     assemble_cue_guard(ESM_CUE_ID, ESM_CUE_RESUME_VA, ESM_EPILOGUE_VA)
 }
@@ -612,8 +654,8 @@ pub fn assemble_esm_guard() -> Vec<u8> {
 pub fn assemble_esm_dummy(l: &Layout) -> Vec<u8> {
     let table = l.esm_dummy;
     let record = table + 0x20;
-    let scratch = record + 0x20;
-    let mut b = vec![0u8; 0x60];
+    let scratch = table + 0x38;
+    let mut b = vec![0u8; 0x48];
     for i in 0..8 {
         b[i * 4..i * 4 + 4].copy_from_slice(&record.to_le_bytes());
     }
@@ -939,6 +981,38 @@ pub fn edits_966() -> Vec<ModuleEdit> {
     v
 }
 
+/// PROT 951 (Chaos Flare, `0x36`) edits. A single-victim cast (the victim seat
+/// is `caster[+0x1DD]`): the caster walks up, plays its cast clip (raw row 8,
+/// the Recover row on a party, which becomes row `0x0A`), strikes once and
+/// stays. One loop hides every seat of the victim side except the victim
+/// (`beq s0,s6`, so its counter is the absolute seat), and the voice cue gets
+/// the stream guard.
+pub fn edits_951() -> Vec<ModuleEdit> {
+    let l = layout();
+    let ed = |va, expect, replace| ModuleEdit {
+        va,
+        expect,
+        replace,
+    };
+    vec![
+        ed(0x801F_6D60, 0x2402_0008, stage_imm(STAGE_ROW_A)),
+        ed(
+            0x801F_6E38,
+            0x9042_0000,
+            m::lbu(V0, GP, gp_off(1)), // end seat
+        ),
+        ed(
+            0x801F_6E44,
+            m::addu(S0, ZERO, ZERO),
+            m::lbu(S0, GP, gp_off(0)),
+        ),
+        ed(0x801F_6E50, 0x3C02_801D, m::lw(V1, GP, gp_off(8))),
+        ed(0x801F_6E54, m::addiu(V1, V0, 0x9370), m::nop()),
+        ed(0x801F_6E80, 0x9042_0000, m::lbu(V0, GP, gp_off(1))),
+        ed(CF_CUE_SITE_VA, m::jal(CUE_FN_VA), m::j(l.guard_951)),
+    ]
+}
+
 /// Module PROT entry and edits for a spell.
 pub fn module_for(spell: u8) -> Option<(usize, Vec<ModuleEdit>)> {
     match spell {
@@ -948,6 +1022,7 @@ pub fn module_for(spell: u8) -> Option<(usize, Vec<ModuleEdit>)> {
         SPELL_MYSTIC_CIRCLE => Some((938, edits_938())),
         SPELL_MYSTIC_SHIELD => Some((940, edits_940())),
         SPELL_EVIL_SERU => Some((966, edits_966())),
+        SPELL_CHAOS_FLARE => Some((951, edits_951())),
         _ => None,
     }
 }
@@ -1106,6 +1181,9 @@ pub fn install(
     }
     if readef_base != 0 && specials.iter().any(|s| s.spell == SPELL_MYSTIC_CIRCLE) {
         changed |= write_scus(patcher, l.guard_938, &assemble_mc_guard())?;
+    }
+    if readef_base != 0 && specials.iter().any(|s| s.spell == SPELL_CHAOS_FLARE) {
+        changed |= write_scus(patcher, l.guard_951, &assemble_cf_guard())?;
     }
     if readef_base != 0 && specials.iter().any(|s| s.spell == SPELL_EVIL_SERU) {
         changed |= write_scus(patcher, l.guard_966, &assemble_esm_guard())?;
@@ -1322,6 +1400,14 @@ mod tests {
         let mut cpu = Cpu::new();
         let l = layout();
         cpu.load(l.hook, &assemble_readef_request(&l));
+        let routed: Vec<Special> = [0x37u8, 0x4B, 0xB7, 0xAD]
+            .iter()
+            .map(|&spell| Special {
+                constant: 0x27,
+                spell,
+            })
+            .collect();
+        cpu.load(l.rows, &row_table(&routed, &[]).unwrap());
         cpu.wr8(l.readef, configured);
         cpu.wr32(CTX_PTR_VA, CTX);
         cpu.wr8(CTX + 0x277, seeded);
@@ -1351,6 +1437,7 @@ mod tests {
     fn party_spells_and_unconfigured_builds_request_nothing() {
         assert_eq!(readef_request(0x37, 0x36, 0), (0, 0), "Guilty Cross");
         assert_eq!(readef_request(0x4B, 0x36, 0), (0, 0), "Hyper Crush");
+        assert_eq!(readef_request(0x99, 0x36, 0), (0, 0), "not routed");
         assert_eq!(readef_request(0xB7, 0, 0), (0, 0), "no group configured");
     }
 
@@ -1484,6 +1571,8 @@ mod tests {
             assemble_shield_caster(),
             assemble_shield_pass(&l),
             assemble_mc_guard(),
+            assemble_esm_guard(),
+            assemble_cf_guard(),
         ] {
             assert!(crate::hazard::load_hazards(&words(&code)).is_empty());
         }
@@ -1506,7 +1595,8 @@ mod tests {
         // the guards and the stand-in table sit behind them
         assert!(l.shield_pass + assemble_shield_pass(&l).len() as u32 <= l.guard_938);
         assert!(l.guard_938 + assemble_mc_guard().len() as u32 <= l.guard_966);
-        assert!(l.guard_966 + assemble_esm_guard().len() as u32 <= l.esm_dummy);
+        assert!(l.guard_966 + assemble_esm_guard().len() as u32 <= l.guard_951);
+        assert!(l.guard_951 + assemble_cf_guard().len() as u32 <= l.esm_dummy);
         assert!(l.esm_dummy + assemble_esm_dummy(&l).len() as u32 <= HOOK_END_VA);
         // the routines do not overlap
         assert!(l.hook + assemble_readef_request(&l).len() as u32 <= l.shield_finisher);

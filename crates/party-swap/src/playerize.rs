@@ -34,6 +34,7 @@ use legaia_actor_formats::battle_data_pack::decode_record;
 pub mod boss;
 mod frame_bake;
 mod hands;
+pub mod part_fit;
 mod rebuild;
 mod section_record;
 mod texture_band;

@@ -122,7 +122,7 @@ pub struct MonsterizedPlayer {
 // Pose math (shared with the probe measurements): PSX rotation order
 // Rz * Ry * Rx, angles in 1/4096 turns, y-down GTE space.
 
-fn rot_matrix(p: &PartPose) -> [[f32; 3]; 3] {
+pub(crate) fn rot_matrix(p: &PartPose) -> [[f32; 3]; 3] {
     let rad = |r: u16| (r as f32) * std::f32::consts::TAU / 4096.0;
     let (sx, cx) = rad(p.rx).sin_cos();
     let (sy, cy) = rad(p.ry).sin_cos();
