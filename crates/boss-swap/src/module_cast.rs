@@ -51,7 +51,8 @@ use legaia_code_hooks::arenas::{
     ARENA1_END_VA, ARENA1_VA, ARENA2_END_VA, ARENA2_VA, SCUS_GAP_END_VA, SCUS_GAP_VA,
 };
 use legaia_code_hooks::mips::{
-    self as m, A0, A1, GP, RA, S0, S2, S3, S5, SP, T0, T1, T2, T3, T4, T5, T6, T7, T8, V0, V1, ZERO,
+    self as m, A0, A1, A2, GP, RA, S0, S2, S3, S5, SP, T0, T1, T2, T3, T4, T5, T6, T7, T8, V0, V1,
+    ZERO,
 };
 use legaia_disc_patch::disc::DiscPatcher;
 
@@ -87,6 +88,8 @@ pub const SPELL_GUILTY_CROSS: u8 = 0x37;
 pub const SPELL_MYSTIC_CIRCLE: u8 = 0xB7;
 /// Cort's Mystic Shield (PROT 940, tick body `0x801F7240`).
 pub const SPELL_MYSTIC_SHIELD: u8 = 0xAC;
+/// Cort's Evil Seru Magic (PROT 966, tick body `0x801F6A74`).
+pub const SPELL_EVIL_SERU: u8 = 0xAD;
 
 /// The art each spell is routed onto by default (`--special` overrides):
 /// Somersault, Hyper Elbow and Slash Kick.
@@ -95,6 +98,7 @@ pub fn default_constant(spell: u8) -> Option<u8> {
         SPELL_HYPER_CRUSH | SPELL_GUILTY_CROSS => Some(0x27),
         SPELL_HYPER_LIGHTNING | SPELL_MYSTIC_CIRCLE => Some(0x29),
         SPELL_MYSTIC_SHIELD => Some(0x26),
+        SPELL_EVIL_SERU => Some(0x28),
         _ => None,
     }
 }
@@ -134,6 +138,8 @@ pub fn stage_entries(spell: u8) -> Option<StageEntries> {
         SPELL_MYSTIC_CIRCLE => (None, Some(0x07)),
         // the shield body stages no caster pose: the caster holds its idle
         SPELL_MYSTIC_SHIELD => (None, None),
+        // Evil Seru Magic stages raw row 6 once (the pooled row) and row 0
+        SPELL_EVIL_SERU => (None, Some(0x06)),
         _ => return None,
     };
     Some(StageEntries { row_a, pooled })
@@ -168,6 +174,10 @@ pub struct Layout {
     pub owner: u32,
     /// Mystic Circle's phase-0 guard (waits for the texture stream).
     pub guard_938: u32,
+    /// Evil Seru Magic's phase-0 guard.
+    pub guard_966: u32,
+    /// Evil Seru Magic's stand-in record[0] table (see [`assemble_esm_dummy`]).
+    pub esm_dummy: u32,
 }
 
 pub fn layout() -> Layout {
@@ -184,6 +194,8 @@ pub fn layout() -> Layout {
         shield_pass: HOOK_VA + 0x150,
         owner: ARENA2_VA + 0x45,
         guard_938: HOOK_VA + 0x1A0,
+        guard_966: HOOK_VA + 0x1E0,
+        esm_dummy: HOOK_VA + 0x220,
     }
 }
 
@@ -346,6 +358,7 @@ pub fn assemble_prep(l: &Layout) -> Vec<u8> {
     a.op(m::sb(T4, GP, gp_off(0)));
     a.op(m::sb(T5, GP, gp_off(1)));
     a.op(m::sb(T7, GP, gp_off(2)));
+    a.op(m::sb(T6, GP, gp_off(3))); // victim count
     a.op(m::sll(T8, T4, 2));
     a.op(m::lui(T0, m::hi(ACTOR_TABLE_VA)));
     a.op(m::addiu(T0, T0, m::lo(ACTOR_TABLE_VA)));
@@ -546,20 +559,24 @@ pub fn edits_940() -> Vec<ModuleEdit> {
     ]
 }
 
-/// The voice cue call of Mystic Circle's phase 0 (`jal FUN_8004FCC8(0x1AC)`).
+/// The voice cue call every cast module opens with (`jal FUN_8004FCC8(cue)`).
 const CUE_FN_VA: u32 = 0x8004_FCC8;
 const MC_CUE_SITE_VA: u32 = 0x801F_6AA4;
 const MC_CUE_RESUME_VA: u32 = 0x801F_6AAC;
 const MC_EPILOGUE_VA: u32 = 0x801F_7240;
 const MC_CUE_ID: u16 = 0x1AC;
+const ESM_CUE_SITE_VA: u32 = 0x801F_6B1C;
+const ESM_CUE_RESUME_VA: u32 = 0x801F_6B24;
+const ESM_EPILOGUE_VA: u32 = 0x801F_8D34;
+const ESM_CUE_ID: u16 = 0x1AE;
 
 /// A cast whose texture group was requested from the route stub starts while
 /// the stream is still reading the CD, and the opening voice cue (CD-XA on the
-/// same drive) dies with it. Mystic Circle's phase 0 begins with that cue, so
-/// it waits (the tick returns "busy" and phase 0 runs again next frame) until
-/// the streaming applier (`ctx[+0x276]`) is idle. Entered by a `j` that
-/// replaces the cue's `jal` (the delay slot is the original `addiu a0`).
-pub fn assemble_mc_guard() -> Vec<u8> {
+/// same drive) dies with it. A module's phase 0 begins with that cue, so it
+/// waits (the tick returns "busy" and phase 0 runs again next frame) until the
+/// streaming applier (`ctx[+0x276]`) is idle. Entered by a `j` that replaces
+/// the cue's `jal` (the delay slot is the original `addiu a0,zero,cue`).
+pub fn assemble_cue_guard(cue: u16, resume: u32, exit: u32) -> Vec<u8> {
     let mut a = Asm::new();
     let wait = a.label();
     a.op(m::lui(T0, 0x8008));
@@ -570,13 +587,38 @@ pub fn assemble_mc_guard() -> Vec<u8> {
     a.br(wait, move |o| m::bne(T0, ZERO, o));
     a.op(m::nop());
     a.op(m::jal(CUE_FN_VA));
-    a.op(m::addiu(A0, ZERO, MC_CUE_ID));
-    a.op(m::j(MC_CUE_RESUME_VA));
+    a.op(m::addiu(A0, ZERO, cue));
+    a.op(m::j(resume));
     a.op(m::nop());
     a.bind(wait);
-    a.op(m::j(MC_EPILOGUE_VA));
+    a.op(m::j(exit));
     a.op(m::nop());
     words_to_bytes(a.finish())
+}
+
+pub fn assemble_mc_guard() -> Vec<u8> {
+    assemble_cue_guard(MC_CUE_ID, MC_CUE_RESUME_VA, MC_EPILOGUE_VA)
+}
+
+pub fn assemble_esm_guard() -> Vec<u8> {
+    assemble_cue_guard(ESM_CUE_ID, ESM_CUE_RESUME_VA, ESM_EPILOGUE_VA)
+}
+
+/// Evil Seru Magic's arm 0 shrinks the victims and halves a field two
+/// pointers deep in each seat's record[0] (`*(0x801C9360 + seat * 4) -> +0x14
+/// -> +0xE`), and arm 28 puts it back. Monster seats have no such record[0],
+/// so the loops read this stand-in table instead: eight pointers to one
+/// record whose `+0x14` points at a scratch halfword.
+pub fn assemble_esm_dummy(l: &Layout) -> Vec<u8> {
+    let table = l.esm_dummy;
+    let record = table + 0x20;
+    let scratch = record + 0x20;
+    let mut b = vec![0u8; 0x60];
+    for i in 0..8 {
+        b[i * 4..i * 4 + 4].copy_from_slice(&record.to_le_bytes());
+    }
+    b[0x20 + 0x14..0x20 + 0x18].copy_from_slice(&scratch.to_le_bytes());
+    b
 }
 
 /// One expect-verified word edit inside a module image.
@@ -777,6 +819,126 @@ pub fn edits_938() -> Vec<ModuleEdit> {
     v
 }
 
+/// How a word of PROT 966's Evil Seru Magic body is rewritten.
+#[derive(Debug, Clone, Copy)]
+enum Site {
+    /// `lbu rX,0(ctx)` (the party count) becomes the victim count.
+    LbuCount(u32),
+    /// The same, for a loop whose counter is the victim *seat*: the end seat.
+    LbuEnd(u32),
+    /// `move rX,zero` before such a loop becomes the first victim seat.
+    LbuStart(u32),
+    /// `lui` of the actor-table base becomes the load of the first victim's
+    /// table cell (the `addiu` after it becomes a `nop`).
+    LwBase(u32),
+    Nop,
+    /// The two words that build the record[0] table base become the stand-in.
+    Rec0Lui(u32),
+    Rec0Addiu(u32),
+}
+
+const ESM_SITES: &[(u32, u32, Site)] = &[
+    (0x801F6B9C, 0x90620000, Site::LbuCount(V0)),
+    (0x801F6BB8, 0x3C02801D, Site::Rec0Lui(V0)),
+    (0x801F6BBC, 0x24469360, Site::Rec0Addiu(A2)),
+    (0x801F6BC8, 0x3C02801D, Site::LwBase(A1)),
+    (0x801F6BCC, 0x24459370, Site::Nop),
+    (0x801F6C1C, 0x90630000, Site::LbuCount(V1)),
+    (0x801F6D10, 0x90420000, Site::LbuCount(V0)),
+    (0x801F6D68, 0x90420000, Site::LbuCount(V0)),
+    (0x801F6D7C, 0x3C02801D, Site::LwBase(V1)),
+    (0x801F6D80, 0x24439370, Site::Nop),
+    (0x801F6DA4, 0x90420000, Site::LbuCount(V0)),
+    (0x801F72E4, 0x90420000, Site::LbuCount(V0)),
+    (0x801F7300, 0x3C02801D, Site::LwBase(V1)),
+    (0x801F7304, 0x24439370, Site::Nop),
+    (0x801F7328, 0x90420000, Site::LbuCount(V0)),
+    (0x801F73F0, 0x90420000, Site::LbuCount(V0)),
+    (0x801F7410, 0x3C02801D, Site::LwBase(A2)),
+    (0x801F7414, 0x24469370, Site::Nop),
+    (0x801F74FC, 0x90420000, Site::LbuCount(V0)),
+    (0x801F75D4, 0x90420000, Site::LbuCount(V0)),
+    (0x801F75F4, 0x3C02801D, Site::LwBase(A2)),
+    (0x801F75F8, 0x24469370, Site::Nop),
+    (0x801F76E0, 0x90420000, Site::LbuCount(V0)),
+    (0x801F77A4, 0x90420000, Site::LbuCount(V0)),
+    (0x801F77C4, 0x3C02801D, Site::LwBase(A2)),
+    (0x801F77C8, 0x24469370, Site::Nop),
+    (0x801F78B0, 0x90420000, Site::LbuCount(V0)),
+    (0x801F7970, 0x90420000, Site::LbuCount(V0)),
+    (0x801F7990, 0x3C02801D, Site::LwBase(A2)),
+    (0x801F7994, 0x24469370, Site::Nop),
+    (0x801F7A7C, 0x90420000, Site::LbuCount(V0)),
+    (0x801F7C18, 0x3C02801D, Site::LwBase(V1)),
+    (0x801F7C1C, 0x24439370, Site::Nop),
+    (0x801F7C4C, 0x90420000, Site::LbuCount(V0)),
+    (0x801F7ED0, 0x90420000, Site::LbuCount(V0)),
+    (0x801F7EE8, 0x3C02801D, Site::LwBase(V1)),
+    (0x801F7EEC, 0x24439370, Site::Nop),
+    (0x801F7F10, 0x90420000, Site::LbuCount(V0)),
+    (0x801F85BC, 0x90620000, Site::LbuEnd(V0)),
+    (0x801F85C8, 0x00009821, Site::LbuStart(S3)),
+    (0x801F85CC, 0x3C02801D, Site::LwBase(S2)),
+    (0x801F85D0, 0x24529370, Site::Nop),
+    (0x801F86B8, 0x90420000, Site::LbuEnd(V0)),
+    (0x801F86F0, 0x90420000, Site::LbuCount(V0)),
+    (0x801F8708, 0x3C02801D, Site::LwBase(A1)),
+    (0x801F870C, 0x24459370, Site::Nop),
+    (0x801F8744, 0x90420000, Site::LbuCount(V0)),
+    (0x801F87F4, 0x90420000, Site::LbuCount(V0)),
+    (0x801F8808, 0x3C02801D, Site::Rec0Lui(V0)),
+    (0x801F880C, 0x24489360, Site::Rec0Addiu(T0)),
+    (0x801F8810, 0x3C02801D, Site::LwBase(A1)),
+    (0x801F8814, 0x24459370, Site::Nop),
+    (0x801F88A8, 0x90620000, Site::LbuCount(V0)),
+    (0x801F89B4, 0x90420000, Site::LbuCount(V0)),
+    (0x801F89D0, 0x3C02801D, Site::LwBase(A1)),
+    (0x801F89D4, 0x24459370, Site::Nop),
+    (0x801F8EB4, 0x90420000, Site::LbuEnd(V0)),
+    (0x801F8EC0, 0x00009821, Site::LbuStart(S3)),
+    (0x801F8EC4, 0x3C02801D, Site::LwBase(S2)),
+    (0x801F8EC8, 0x24529370, Site::Nop),
+    (0x801F8FB4, 0x90420000, Site::LbuEnd(V0)),
+];
+
+/// PROT 966 (Evil Seru Magic, `0xAD`) edits: 29 arms behind one dispatch. The
+/// party row `actor_table[0 .. ctx[+0]]` is the victim row in retail (hidden,
+/// shrunk and re-seated, struck twice, shown again); every loop over it counts
+/// from zero with a pointer that steps a cell at a time, so each is pointed at
+/// the opposite side with two loads: the count from the sweep scratch (`+3`,
+/// the victim count) and the pointer from `+8` (`&actor_table[first victim]`).
+/// The two loops whose counter doubles as the victim seat (the second hit and
+/// the stager's first hit) count seats instead (`+0` .. `+1`). The caster's one
+/// stage pose is raw row 6, which already is the pooled row.
+pub fn edits_966() -> Vec<ModuleEdit> {
+    let l = layout();
+    let mut v: Vec<ModuleEdit> = ESM_SITES
+        .iter()
+        .map(|&(va, expect, site)| {
+            let replace = match site {
+                Site::LbuCount(r) => m::lbu(r, GP, gp_off(3)),
+                Site::LbuEnd(r) => m::lbu(r, GP, gp_off(1)),
+                Site::LbuStart(r) => m::lbu(r, GP, gp_off(0)),
+                Site::LwBase(r) => m::lw(r, GP, gp_off(8)),
+                Site::Nop => m::nop(),
+                Site::Rec0Lui(r) => m::lui(r, m::hi(l.esm_dummy)),
+                Site::Rec0Addiu(r) => m::addiu(r, V0, m::lo(l.esm_dummy)),
+            };
+            ModuleEdit {
+                va,
+                expect,
+                replace,
+            }
+        })
+        .collect();
+    v.push(ModuleEdit {
+        va: ESM_CUE_SITE_VA,
+        expect: m::jal(CUE_FN_VA),
+        replace: m::j(l.guard_966),
+    });
+    v
+}
+
 /// Module PROT entry and edits for a spell.
 pub fn module_for(spell: u8) -> Option<(usize, Vec<ModuleEdit>)> {
     match spell {
@@ -785,6 +947,7 @@ pub fn module_for(spell: u8) -> Option<(usize, Vec<ModuleEdit>)> {
         SPELL_GUILTY_CROSS => Some((944, edits_944())),
         SPELL_MYSTIC_CIRCLE => Some((938, edits_938())),
         SPELL_MYSTIC_SHIELD => Some((940, edits_940())),
+        SPELL_EVIL_SERU => Some((966, edits_966())),
         _ => None,
     }
 }
@@ -943,6 +1106,10 @@ pub fn install(
     }
     if readef_base != 0 && specials.iter().any(|s| s.spell == SPELL_MYSTIC_CIRCLE) {
         changed |= write_scus(patcher, l.guard_938, &assemble_mc_guard())?;
+    }
+    if readef_base != 0 && specials.iter().any(|s| s.spell == SPELL_EVIL_SERU) {
+        changed |= write_scus(patcher, l.guard_966, &assemble_esm_guard())?;
+        changed |= write_scus(patcher, l.esm_dummy, &assemble_esm_dummy(&l))?;
     }
     if specials.iter().any(|s| s.spell == SPELL_MYSTIC_SHIELD) {
         for (va, code) in [
@@ -1336,6 +1503,11 @@ mod tests {
         ] {
             assert!((va + code.len() as u32) <= HOOK_END_VA);
         }
+        // the guards and the stand-in table sit behind them
+        assert!(l.shield_pass + assemble_shield_pass(&l).len() as u32 <= l.guard_938);
+        assert!(l.guard_938 + assemble_mc_guard().len() as u32 <= l.guard_966);
+        assert!(l.guard_966 + assemble_esm_guard().len() as u32 <= l.esm_dummy);
+        assert!(l.esm_dummy + assemble_esm_dummy(&l).len() as u32 <= HOOK_END_VA);
         // the routines do not overlap
         assert!(l.hook + assemble_readef_request(&l).len() as u32 <= l.shield_finisher);
         assert!(l.shield_finisher + assemble_shield_finisher(&l).len() as u32 <= l.shield_store);

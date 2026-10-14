@@ -209,8 +209,9 @@ fn cort_first_form_routes_guilty_cross() {
     );
     // Mystic Circle rides Hyper Elbow with its one pose in the pool
     assert_eq!(scus[off(l.table) + 0x29 - 0x10], 0xB7);
-    assert_eq!(scus[at + 4], 0xB7, "slot 1 routes Mystic Circle");
-    let pooled = u16::from_le_bytes(scus[at + 6..at + 8].try_into().unwrap()) as usize;
+    assert_eq!(scus[at + 4], 0xAD, "slot 1 routes Evil Seru Magic");
+    assert_eq!(scus[at + 8], 0xB7, "slot 2 routes Mystic Circle");
+    let pooled = u16::from_le_bytes(scus[at + 10..at + 12].try_into().unwrap()) as usize;
     let guard = module_cast::assemble_mc_guard();
     assert_eq!(
         &scus[off(l.guard_938)..][..guard.len()],
@@ -359,4 +360,56 @@ fn cort_first_form_routes_mystic_shield() {
 
 fn word_scus(scus: &[u8], off: usize) -> u32 {
     u32::from_le_bytes(scus[off..off + 4].try_into().unwrap())
+}
+
+/// Cort's Evil Seru Magic: every edit lands on the word it expects, nothing
+/// reads a freshly loaded register, and the stand-in table and guard are in.
+#[test]
+fn cort_first_form_routes_evil_seru_magic() {
+    let Some(image) = disc() else { return };
+    let mut p = DiscPatcher::open(image).expect("open disc");
+    let report = apply(
+        &mut p,
+        &Options {
+            monster: 180,
+            ..Options::default()
+        },
+    )
+    .expect("apply boss swap");
+    assert!(
+        report.notes.iter().any(|n| n.contains("0xad")),
+        "{:?}",
+        report.notes
+    );
+    let l = module_cast::layout();
+    let scus = p.read_named_file("SCUS_942.54").unwrap();
+    let off = |va: u32| legaia_game_tables::item_names::file_offset_for_va(&scus, va).unwrap();
+    assert_eq!(scus[off(l.table) + 0x28 - 0x10], 0xAD, "Charging Scorch");
+    let m966 = p.read_entry(966).unwrap();
+    let edits = module_cast::edits_966();
+    assert!(edits.len() > 50);
+    for e in &edits {
+        assert_eq!(word(&m966, e.va), e.replace, "966 {:#x}", e.va);
+    }
+    let ws: Vec<u32> = m966
+        .chunks(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for e in &edits {
+        let i = ((e.va - 0x801F_69D8) / 4) as usize;
+        let lo = i.saturating_sub(1);
+        let hi = (i + 3).min(ws.len());
+        for h in legaia_boss_swap::hazard::load_hazards(&ws[lo..hi]) {
+            let at = lo + h;
+            assert!(
+                !(at == i || at + 1 == i),
+                "load-delay hazard at {:#x}",
+                0x801F_69D8 + at as u32 * 4
+            );
+        }
+    }
+    let guard = module_cast::assemble_esm_guard();
+    assert_eq!(&scus[off(l.guard_966)..][..guard.len()], guard.as_slice());
+    let dummy = module_cast::assemble_esm_dummy(&l);
+    assert_eq!(&scus[off(l.esm_dummy)..][..dummy.len()], dummy.as_slice());
 }

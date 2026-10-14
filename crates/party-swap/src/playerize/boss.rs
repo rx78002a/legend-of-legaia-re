@@ -486,13 +486,20 @@ pub fn stage_entry(
     e
 }
 
+/// Poses kept past a stage clip's parked frame.
+const STAGE_TAIL_FRAMES: usize = 3;
+
 /// A stage pose as the plan wants it embedded, decimated by `k` (1 = whole).
+/// A clip that parks in a hold window never plays past it while its cast runs
+/// (the cast ends by re-staging the idle), so the poses after the window are
+/// dropped but a short tail.
 fn stage_clip(k: usize, clip: &BossClip) -> BossClip {
-    if k > 1 {
-        clip.decimated(k)
-    } else {
-        clip.clone()
+    let mut clip = clip.clone();
+    if clip.head[0x84] != 0 {
+        let keep = usize::from(clip.head[0x86]) + STAGE_TAIL_FRAMES;
+        clip.frames.truncate(keep.max(2));
     }
+    if k > 1 { clip.decimated(k) } else { clip }
 }
 
 /// Frames between consecutive hits of a multi-hit art playing the fireball.
