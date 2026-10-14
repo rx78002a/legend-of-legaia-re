@@ -267,7 +267,7 @@ pub struct ClipMap {
     /// Victory source and the idle it settles into.
     pub victory: usize,
     pub idle: usize,
-    /// Calm charge clip the Spirit command (art record 0) plays; `None`
+    /// Calm clip the Spirit command (art record 0) plays; `None`
     /// keeps the host's stream there.
     pub spirit: Option<usize>,
 }
@@ -360,51 +360,34 @@ pub fn add_fireball_clip(clips: &mut Vec<BossClip>) -> Result<usize> {
     Ok(clips.len() - 1)
 }
 
-/// Frames of the boss cast clip kept as the charge crouch.
-const CHARGE_FRAMES: usize = 12;
 /// Frames the Spirit clip runs (the art stream is addressed up to row 58).
 const SPIRIT_FRAMES: usize = 59;
 /// Main ME entry the multi-hit move moves to when entry 0 holds the Spirit clip.
 const MULTI_ENTRY: usize = 7;
 
-/// Append two calm clips built from the opening of the boss's cast clip (the
-/// crouch before the release) and return `(crouch, spirit)`: `crouch` is the
-/// short pose the host's slot 9 plays for an item, a spell or a defeat, and
-/// `spirit` holds the same crouch out to the Spirit command's length. Both
-/// take the boss idle's head, so no hit event, effect or sound rides along.
-pub fn add_charge_clips(clips: &mut Vec<BossClip>) -> Result<(usize, usize)> {
-    let cast = find_tag(clips, 0x23).context("boss has no tag 0x23 cast clip")?;
+/// Append two calm clips made of the boss idle and return `(pose, spirit)`:
+/// `pose` is the idle the host's slot 9 plays for an item, a spell or a
+/// defeat, and `spirit` cycles the idle out to the Spirit command's length.
+/// Both carry the idle's head, so no hit event, effect or sound rides along.
+pub fn add_calm_clips(clips: &mut Vec<BossClip>) -> Result<(usize, usize)> {
     let idle = find_tag(clips, 0).context("boss has no idle clip")?;
-    let mut head = clips[idle].head.clone();
+    let src = clips[idle].clone();
+    let mut head = src.head.clone();
     head[0x10..0x14].fill(0);
     head[0x14..0x74].fill(0);
-    head[0x78] = clips[cast].head[0x78].max(1);
     head[0x84..0x87].fill(0);
-    let crouch: Vec<Vec<PartPose>> = clips[cast]
-        .frames
-        .iter()
-        .take(CHARGE_FRAMES)
-        .cloned()
+    let cycled: Vec<Vec<PartPose>> = (0..SPIRIT_FRAMES)
+        .map(|i| src.frames[i % src.frames.len()].clone())
         .collect();
-    if crouch.is_empty() {
-        bail!("boss cast clip has no frames");
-    }
-    let mut hold = crouch.clone();
-    let last = hold[hold.len() - 1].clone();
-    hold.resize(SPIRIT_FRAMES, last);
-    let tag = clips[idle].tag;
-    let entry = clips[idle].entry;
     clips.push(BossClip {
-        entry,
-        tag,
         head: head.clone(),
-        frames: crouch,
+        frames: src.frames.clone(),
+        ..src.clone()
     });
     clips.push(BossClip {
-        entry,
-        tag,
         head,
-        frames: hold,
+        frames: cycled,
+        ..src
     });
     Ok((clips.len() - 2, clips.len() - 1))
 }

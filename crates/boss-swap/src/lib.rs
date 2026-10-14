@@ -32,7 +32,7 @@ pub struct Options {
     /// swing grunt, victory barks).
     pub mute_host_voice: bool,
     /// Replace the item / spell / defeat pose (record[0] slot 9) and the Spirit
-    /// command's clip with a calm crouch, instead of the boss's knockdown and
+    /// command's clip with the boss idle, instead of the boss's knockdown and
     /// multi-hit move.
     pub calm_support: bool,
     /// The fireball projectile keeps the monster spell's own damage; `false`
@@ -92,13 +92,13 @@ pub fn apply(patcher: &mut DiscPatcher, opts: &Options) -> Result<Report> {
         None
     };
     let calm = if opts.calm_support {
-        Some(boss::add_charge_clips(&mut clips)?)
+        Some(boss::add_calm_clips(&mut clips)?)
     } else {
         None
     };
     let mut map = boss::default_clip_map(&clips)?;
-    if let Some((crouch, spirit)) = calm {
-        map.slots.insert(9, crouch);
+    if let Some((pose, spirit)) = calm {
+        map.slots.insert(9, pose);
         map.spirit = Some(spirit);
     }
     let fb = fireball.zip(opts.fireball_art.as_deref());
