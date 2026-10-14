@@ -267,6 +267,9 @@ pub struct ClipMap {
     /// Victory source and the idle it settles into.
     pub victory: usize,
     pub idle: usize,
+    /// Calm charge clip the Spirit command (art record 0) plays; `None`
+    /// keeps the host's stream there.
+    pub spirit: Option<usize>,
 }
 
 fn find_tag(clips: &[BossClip], tag: u8) -> Option<usize> {
@@ -320,6 +323,7 @@ pub fn default_clip_map(clips: &[BossClip]) -> Result<ClipMap> {
         walk,
         victory,
         idle,
+        spirit: None,
     })
 }
 
@@ -354,6 +358,55 @@ pub fn add_fireball_clip(clips: &mut Vec<BossClip>) -> Result<usize> {
     play.head[0x78] = play.head[0x78].max(2);
     clips.push(play);
     Ok(clips.len() - 1)
+}
+
+/// Frames of the boss cast clip kept as the charge crouch.
+const CHARGE_FRAMES: usize = 12;
+/// Frames the Spirit clip runs (the art stream is addressed up to row 58).
+const SPIRIT_FRAMES: usize = 59;
+/// Main ME entry the multi-hit move moves to when entry 0 holds the Spirit clip.
+const MULTI_ENTRY: usize = 7;
+
+/// Append two calm clips built from the opening of the boss's cast clip (the
+/// crouch before the release) and return `(crouch, spirit)`: `crouch` is the
+/// short pose the host's slot 9 plays for an item, a spell or a defeat, and
+/// `spirit` holds the same crouch out to the Spirit command's length. Both
+/// take the boss idle's head, so no hit event, effect or sound rides along.
+pub fn add_charge_clips(clips: &mut Vec<BossClip>) -> Result<(usize, usize)> {
+    let cast = find_tag(clips, 0x23).context("boss has no tag 0x23 cast clip")?;
+    let idle = find_tag(clips, 0).context("boss has no idle clip")?;
+    let mut head = clips[idle].head.clone();
+    head[0x10..0x14].fill(0);
+    head[0x14..0x74].fill(0);
+    head[0x78] = clips[cast].head[0x78].max(1);
+    head[0x84..0x87].fill(0);
+    let crouch: Vec<Vec<PartPose>> = clips[cast]
+        .frames
+        .iter()
+        .take(CHARGE_FRAMES)
+        .cloned()
+        .collect();
+    if crouch.is_empty() {
+        bail!("boss cast clip has no frames");
+    }
+    let mut hold = crouch.clone();
+    let last = hold[hold.len() - 1].clone();
+    hold.resize(SPIRIT_FRAMES, last);
+    let tag = clips[idle].tag;
+    let entry = clips[idle].entry;
+    clips.push(BossClip {
+        entry,
+        tag,
+        head: head.clone(),
+        frames: crouch,
+    });
+    clips.push(BossClip {
+        entry,
+        tag,
+        head,
+        frames: hold,
+    });
+    Ok((clips.len() - 2, clips.len() - 1))
 }
 
 /// Fireball timing for an art record entry: `hits` beats from the release
@@ -529,10 +582,22 @@ pub fn plan_boss_with(
         main[1 + i] = MainEntry::Clip(c);
     }
     main[5] = MainEntry::Clip(map.walk);
+    let spirit = map.spirit;
+    if let Some(c) = spirit {
+        if main_entries <= MULTI_ENTRY {
+            bail!("main ME archive has no spare entry for the multi-hit move");
+        }
+        main[0] = MainEntry::Clip(c);
+        main[MULTI_ENTRY] = MainEntry::Clip(map.multi_hit);
+    }
     let mut single_i = 0usize;
     for a in arts.iter_mut().filter(|a| !a.base) {
         a.new_source = if a.stream_source == 0 {
-            0
+            if spirit.is_some() && a.index != 0 {
+                MULTI_ENTRY
+            } else {
+                0
+            }
         } else if a.hits == 0 {
             5
         } else if a.hits == 1 {

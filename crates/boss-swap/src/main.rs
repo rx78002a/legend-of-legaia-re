@@ -5,7 +5,7 @@ use legaia_disc_patch::ppf;
 
 fn usage() -> ! {
     eprintln!(
-        "usage: boss-swap build <disc.bin|.cue> <out.ppf> [--monster N] [--scale F] [--no-fireball] [--fireball-art NAME] [--keep-voices]\n       \
+        "usage: boss-swap build <disc.bin|.cue> <out.ppf> [--monster N] [--scale F] [--no-fireball] [--fireball-art NAME] [--keep-voices] [--keep-support-anims] [--free-fireball]\n       \
          (writes a PPF 3.0 patch; the disc image is never modified)"
     );
     std::process::exit(2);
@@ -46,6 +46,14 @@ fn main() -> Result<()> {
             }
             "--keep-voices" => {
                 opts.mute_host_voice = false;
+                i += 1;
+            }
+            "--keep-support-anims" => {
+                opts.calm_support = false;
+                i += 1;
+            }
+            "--free-fireball" => {
+                opts.fireball_damage = false;
                 i += 1;
             }
             other => bail!("unknown argument {other}"),
@@ -122,6 +130,14 @@ fn render(args: &[String]) -> Result<()> {
             }
             "--keep-voices" => {
                 opts.mute_host_voice = false;
+                i += 1;
+            }
+            "--keep-support-anims" => {
+                opts.calm_support = false;
+                i += 1;
+            }
+            "--free-fireball" => {
+                opts.fireball_damage = false;
                 i += 1;
             }
             "--retail" => {

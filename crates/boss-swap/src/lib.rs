@@ -31,6 +31,13 @@ pub struct Options {
     /// Mute the host character's own voice banks (arts shout, fanfares,
     /// swing grunt, victory barks).
     pub mute_host_voice: bool,
+    /// Replace the item / spell / defeat pose (record[0] slot 9) and the Spirit
+    /// command's clip with a calm crouch, instead of the boss's knockdown and
+    /// multi-hit move.
+    pub calm_support: bool,
+    /// The fireball projectile keeps the monster spell's own damage; `false`
+    /// zeroes its power so only the art's hits damage.
+    pub fireball_damage: bool,
 }
 
 impl Default for Options {
@@ -40,6 +47,8 @@ impl Default for Options {
             scale: 0.8,
             fireball_art: Some("Somersault".to_string()),
             mute_host_voice: true,
+            calm_support: true,
+            fireball_damage: true,
         }
     }
 }
@@ -77,13 +86,23 @@ pub fn apply(patcher: &mut DiscPatcher, opts: &Options) -> Result<Report> {
 
     let mut clips = boss::boss_clips(&archive, opts.monster)?;
     let rec0 = boss::Record0::parse(&player)?;
-    let plan = if let Some(art) = &opts.fireball_art {
-        let fireball = boss::add_fireball_clip(&mut clips)?;
-        let map = boss::default_clip_map(&clips)?;
-        boss::plan_boss_with(&rec0, map, main_n, base_n, Some((fireball, art.as_str())))?
+    let fireball = if opts.fireball_art.is_some() {
+        Some(boss::add_fireball_clip(&mut clips)?)
     } else {
-        boss::plan_boss(&rec0, &clips, main_n, base_n)?
+        None
     };
+    let calm = if opts.calm_support {
+        Some(boss::add_charge_clips(&mut clips)?)
+    } else {
+        None
+    };
+    let mut map = boss::default_clip_map(&clips)?;
+    if let Some((crouch, spirit)) = calm {
+        map.slots.insert(9, crouch);
+        map.spirit = Some(spirit);
+    }
+    let fb = fireball.zip(opts.fireball_art.as_deref());
+    let plan = boss::plan_boss_with(&rec0, map, main_n, base_n, fb)?;
     report.notes.push(format!(
         "boss #{}: {} clips; art records: {}, main ME entries: {main_n}, base: {base_n}",
         opts.monster,
@@ -169,7 +188,7 @@ pub fn apply(patcher: &mut DiscPatcher, opts: &Options) -> Result<Report> {
         &arch.base,
     )?;
     if opts.fireball_art.is_some() {
-        route_fireball_move(patcher, opts.monster, &mut report)?;
+        route_fireball_move(patcher, opts.monster, opts.fireball_damage, &mut report)?;
     }
     if opts.mute_host_voice {
         mute_vahn_voice(patcher, &mut report)?;
@@ -220,7 +239,12 @@ const SPARE_MOVE_ID: usize = 0x2C;
 /// projectile spawns, while the art's own hit events do the damage; a kill by
 /// the projectile's damage path skips the victim's reaction pose and the
 /// enemy vanishes instead of collapsing.
-fn route_fireball_move(patcher: &mut DiscPatcher, monster: u16, report: &mut Report) -> Result<()> {
+fn route_fireball_move(
+    patcher: &mut DiscPatcher,
+    monster: u16,
+    keep_damage: bool,
+    report: &mut Report,
+) -> Result<()> {
     let archive = patcher.read_entry_footprint(MONSTER_ARCHIVE_ENTRY)?;
     let block = legaia_actor_formats::monster_archive::decode_block(&archive, monster)?
         .context("empty monster slot")?;
@@ -234,6 +258,18 @@ fn route_fireball_move(patcher: &mut DiscPatcher, monster: u16, report: &mut Rep
     }
     if map[FIREBALL_MOVE_ID] != 0 {
         bail!("move id {FIREBALL_MOVE_ID:#x} is already mapped to a power record");
+    }
+    if keep_damage {
+        let id = map[spell];
+        patcher.patch_prot_entry(
+            BATTLE_OVERLAY_ENTRY,
+            (MOVE_POWER_MAP + FIREBALL_MOVE_ID) as u64,
+            &[id],
+        )?;
+        report.notes.push(format!(
+            "move id {FIREBALL_MOVE_ID:#x} -> move-power record {id} (monster magic {spell:#x})"
+        ));
+        return Ok(());
     }
     let spare = map[SPARE_MOVE_ID] as usize;
     if spare == 0 {
