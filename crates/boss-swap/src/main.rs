@@ -338,8 +338,8 @@ fn monster(args: &[String]) -> Result<()> {
                 .copied()
                 .collect();
         }
-        for i in 0..orig.cba_tsb.len() {
-            if k != 99 && foreign[i] {
+        for (i, &is_foreign) in foreign.iter().enumerate() {
+            if k != 99 && is_foreign {
                 vm.cba_tsb[i][0] = monster_archive::relocate_cba(k, 0);
                 vm.cba_tsb[i][1] = monster_archive::relocate_tsb(0x25, 0);
             }

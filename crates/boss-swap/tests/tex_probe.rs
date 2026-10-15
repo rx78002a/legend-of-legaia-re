@@ -394,15 +394,19 @@ fn battle_bank() {
         for (i, pr) in r.programs.iter().enumerate().filter(|(_, p)| p.tones > 0) {
             println!("  program {i}: tones {}", pr.tones);
         }
-        let mut page = 0;
-        for (i, pr) in r.programs.iter().enumerate().filter(|(_, p)| p.tones > 0) {
+        for (page, (i, pr)) in r
+            .programs
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.tones > 0)
+            .enumerate()
+        {
             for (t, tone) in r.tones[page].iter().take(pr.tones as usize).enumerate() {
                 println!(
                     "    p{i} t{t}: vag {} vol {} center {} adsr {:04x}/{:04x}",
                     tone.vag, tone.vol, tone.center, tone.adsr1, tone.adsr2
                 );
             }
-            page += 1;
         }
         println!(
             "  vags: {:?}",
