@@ -177,3 +177,27 @@ fn flat_prims() {
         }
     }
 }
+
+#[test]
+#[ignore]
+fn gap_bytes() {
+    let Some(path) = std::env::var_os("LEGAIA_DISC_BIN") else {
+        return;
+    };
+    let p = DiscPatcher::open(std::fs::read(path).unwrap()).unwrap();
+    let scus = p.read_named_file("SCUS_942.54").unwrap();
+    for (lo, hi) in [(0x8007_AB00u32, 0x8007_AB80u32), (0x8007_AE00, 0x8007_AF40)] {
+        let o = legaia_game_tables::item_names::file_offset_for_va(&scus, lo).unwrap();
+        let n = (hi - lo) as usize;
+        println!(
+            "GAP {lo:#x}..{hi:#x} nonzero {:?}",
+            scus[o..o + n]
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| **b != 0)
+                .map(|(i, _)| i)
+                .take(8)
+                .collect::<Vec<_>>()
+        );
+    }
+}

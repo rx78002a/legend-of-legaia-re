@@ -466,4 +466,34 @@ fn songi_third_form_routes_chaos_flare() {
     assert_eq!(&scus[off(l.guard_951)..][..guard.len()], guard.as_slice());
     let entry = module_cast::assemble_cf_entry();
     assert_eq!(&scus[off(l.cf_entry)..][..entry.len()], entry.as_slice());
+    // Genocidal Cannon rides Hyper Elbow
+    assert_eq!(scus[off(l.table) + 0x29 - 0x10], 0xB3);
+    assert_eq!(&scus[off(l.rows) + 4..][..2], &[0xB3, 1]);
+    let m963 = p.read_entry(963).unwrap();
+    let edits = module_cast::edits_963();
+    assert!(edits.len() > 30);
+    for e in &edits {
+        assert_eq!(word(&m963, e.va), e.replace, "963 {:#x}", e.va);
+    }
+    let ws: Vec<u32> = m963
+        .chunks(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for e in &edits {
+        let i = ((e.va - 0x801F_69D8) / 4) as usize;
+        let lo = i.saturating_sub(1);
+        let hi = (i + 3).min(ws.len());
+        for h in legaia_boss_swap::hazard::load_hazards(&ws[lo..hi]) {
+            let at = lo + h;
+            assert!(
+                !(at == i || at + 1 == i),
+                "load-delay hazard at {:#x}",
+                0x801F_69D8 + at as u32 * 4
+            );
+        }
+    }
+    let guard = module_cast::assemble_gc_guard();
+    assert_eq!(&scus[off(l.guard_963)..][..guard.len()], guard.as_slice());
+    let cell = module_cast::assemble_caster_cell();
+    assert_eq!(&scus[off(l.caster_cell)..][..cell.len()], cell.as_slice());
 }

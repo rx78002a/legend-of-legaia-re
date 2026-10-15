@@ -92,6 +92,8 @@ pub const SPELL_MYSTIC_SHIELD: u8 = 0xAC;
 pub const SPELL_EVIL_SERU: u8 = 0xAD;
 /// Songi's third form: Chaos Flare (PROT 951, tick body `0x801F6A20`).
 pub const SPELL_CHAOS_FLARE: u8 = 0x36;
+/// Songi's third form: Genocidal Cannon (PROT 963, tick body `0x801F6A20`).
+pub const SPELL_GENOCIDAL_CANNON: u8 = 0xB3;
 
 /// Specials whose effects draw from the texture bank of the boss's own readef
 /// group (Cort's rune circle, the Juggernaut and the shield; Songi's flame):
@@ -99,7 +101,11 @@ pub const SPELL_CHAOS_FLARE: u8 = 0x36;
 pub fn needs_group(spell: u8) -> bool {
     matches!(
         spell,
-        SPELL_MYSTIC_CIRCLE | SPELL_MYSTIC_SHIELD | SPELL_EVIL_SERU | SPELL_CHAOS_FLARE
+        SPELL_MYSTIC_CIRCLE
+            | SPELL_MYSTIC_SHIELD
+            | SPELL_EVIL_SERU
+            | SPELL_CHAOS_FLARE
+            | SPELL_GENOCIDAL_CANNON
     )
 }
 
@@ -108,7 +114,7 @@ pub fn needs_group(spell: u8) -> bool {
 pub fn default_constant(spell: u8) -> Option<u8> {
     match spell {
         SPELL_HYPER_CRUSH | SPELL_GUILTY_CROSS | SPELL_CHAOS_FLARE => Some(0x27),
-        SPELL_HYPER_LIGHTNING | SPELL_MYSTIC_CIRCLE => Some(0x29),
+        SPELL_HYPER_LIGHTNING | SPELL_MYSTIC_CIRCLE | SPELL_GENOCIDAL_CANNON => Some(0x29),
         SPELL_MYSTIC_SHIELD => Some(0x26),
         SPELL_EVIL_SERU => Some(0x28),
         _ => None,
@@ -150,7 +156,7 @@ pub fn stage_entries(spell: u8) -> Option<StageEntries> {
         SPELL_GUILTY_CROSS => (Some(0x08), None),
         // Chaos Flare stages raw row 8 too (Songi's third form owns its cast
         // clip at entry 8, like Cort's Guilty Cross)
-        SPELL_CHAOS_FLARE => (Some(0x08), None),
+        SPELL_CHAOS_FLARE | SPELL_GENOCIDAL_CANNON => (Some(0x08), None),
         SPELL_MYSTIC_CIRCLE => (None, Some(0x07)),
         // the shield body stages no caster pose: the caster holds its idle
         SPELL_MYSTIC_SHIELD => (None, None),
@@ -194,9 +200,14 @@ pub struct Layout {
     pub guard_966: u32,
     /// Chaos Flare's voice guard.
     pub guard_951: u32,
-    /// Chaos Flare's loader of the caster's stage entry (see
-    /// [`assemble_cf_entry`]).
+    /// Songi's third form (Chaos Flare, Genocidal Cannon): the loader of the
+    /// caster's stage entry (see [`assemble_cf_entry`]), the caster-cell
+    /// loader (see [`assemble_caster_cell`]) and Genocidal Cannon's voice
+    /// guard. These share the rodata run with the Mystic Shield routines, which
+    /// a Songi build never installs (an install over a used run refuses).
     pub cf_entry: u32,
+    pub caster_cell: u32,
+    pub guard_963: u32,
     /// Evil Seru Magic's stand-in record[0] table (see [`assemble_esm_dummy`]).
     pub esm_dummy: u32,
 }
@@ -216,8 +227,10 @@ pub fn layout() -> Layout {
         owner: ARENA2_VA + 0x45,
         guard_938: HOOK_VA + 0x168,
         guard_966: HOOK_VA + 0x19C,
-        guard_951: HOOK_VA + 0x1D0,
-        cf_entry: HOOK_VA + 0xD4,
+        guard_951: HOOK_VA + 0x80,
+        guard_963: HOOK_VA + 0xB4,
+        cf_entry: HOOK_VA + 0xE8,
+        caster_cell: HOOK_VA + 0x118,
         esm_dummy: HOOK_VA + 0x208,
     }
 }
@@ -611,6 +624,10 @@ const CF_CUE_SITE_VA: u32 = 0x801F_6C60;
 const CF_CUE_RESUME_VA: u32 = 0x801F_6C68;
 const CF_EPILOGUE_VA: u32 = 0x801F_77B4;
 const CF_CUE_ID: u16 = 0x1B5;
+const GC_CUE_SITE_VA: u32 = 0x801F_6AD4;
+const GC_CUE_RESUME_VA: u32 = 0x801F_6ADC;
+const GC_EPILOGUE_VA: u32 = 0x801F_8178;
+const GC_CUE_ID: u16 = 0x1B4;
 
 /// A cast whose texture group was requested from the route stub starts while
 /// the stream is still reading the CD, and the opening voice cue (CD-XA on the
@@ -644,6 +661,10 @@ pub fn assemble_mc_guard() -> Vec<u8> {
 
 pub fn assemble_cf_guard() -> Vec<u8> {
     assemble_cue_guard(CF_CUE_ID, CF_CUE_RESUME_VA, CF_EPILOGUE_VA)
+}
+
+pub fn assemble_gc_guard() -> Vec<u8> {
+    assemble_cue_guard(GC_CUE_ID, GC_CUE_RESUME_VA, GC_EPILOGUE_VA)
 }
 
 pub fn assemble_esm_guard() -> Vec<u8> {
@@ -688,6 +709,27 @@ pub fn assemble_cf_entry() -> Vec<u8> {
     a.op(m::lw(T1, T1, 0)); // record[0] base of the seat
     a.op(m::nop());
     a.op(m::lw(V1, T1, 4 * u16::from(STAGE_ROW_A))); // the row-A entry
+    a.op(m::jr(RA));
+    a.op(m::nop());
+    words_to_bytes(a.finish())
+}
+
+/// Genocidal Cannon's effect stager (`0x801F81A0`, run by the effect VM) seats
+/// its flares on `actor_table[3]`, the first monster: `addiu v1,v1,-0x6C90`
+/// then `lw v0,0xC(v1)` (twice, once per arm). This makes `v1` the table cell
+/// *before* the caster's and loads `v0` = the caster, for a `jal` that
+/// replaces the `addiu` (the delay slot is the original `lw`, harmless on the
+/// stale `v1`, and the return skips it).
+pub fn assemble_caster_cell() -> Vec<u8> {
+    let mut a = Asm::new();
+    a.op(m::lui(T0, 0x8008));
+    a.op(m::lw(T0, T0, 0xBD24)); // ctx
+    a.op(m::lui(T1, m::hi(ACTOR_TABLE_VA - 0xC)));
+    a.op(m::lbu(T0, T0, 0x13)); // caster seat
+    a.op(m::addiu(T1, T1, m::lo(ACTOR_TABLE_VA - 0xC)));
+    a.op(m::sll(T0, T0, 2));
+    a.op(m::addu(V1, T1, T0));
+    a.op(m::lw(V0, V1, 0xC)); // the caster
     a.op(m::jr(RA));
     a.op(m::nop());
     words_to_bytes(a.finish())
@@ -973,18 +1015,10 @@ const ESM_SITES: &[(u32, u32, Site)] = &[
     (0x801F8FB4, 0x90420000, Site::LbuEnd(V0)),
 ];
 
-/// PROT 966 (Evil Seru Magic, `0xAD`) edits: 29 arms behind one dispatch. The
-/// party row `actor_table[0 .. ctx[+0]]` is the victim row in retail (hidden,
-/// shrunk and re-seated, struck twice, shown again); every loop over it counts
-/// from zero with a pointer that steps a cell at a time, so each is pointed at
-/// the opposite side with two loads: the count from the sweep scratch (`+3`,
-/// the victim count) and the pointer from `+8` (`&actor_table[first victim]`).
-/// The two loops whose counter doubles as the victim seat (the second hit and
-/// the stager's first hit) count seats instead (`+0` .. `+1`). The caster's one
-/// stage pose is raw row 6, which already is the pooled row.
-pub fn edits_966() -> Vec<ModuleEdit> {
+/// The word rewrites of a generated site table (see [`Site`]).
+fn site_edits(sites: &[(u32, u32, Site)]) -> Vec<ModuleEdit> {
     let l = layout();
-    let mut v: Vec<ModuleEdit> = ESM_SITES
+    sites
         .iter()
         .map(|&(va, expect, site)| {
             let replace = match site {
@@ -1002,7 +1036,21 @@ pub fn edits_966() -> Vec<ModuleEdit> {
                 replace,
             }
         })
-        .collect();
+        .collect()
+}
+
+/// PROT 966 (Evil Seru Magic, `0xAD`) edits: 29 arms behind one dispatch. The
+/// party row `actor_table[0 .. ctx[+0]]` is the victim row in retail (hidden,
+/// shrunk and re-seated, struck twice, shown again); every loop over it counts
+/// from zero with a pointer that steps a cell at a time, so each is pointed at
+/// the opposite side with two loads: the count from the sweep scratch (`+3`,
+/// the victim count) and the pointer from `+8` (`&actor_table[first victim]`).
+/// The two loops whose counter doubles as the victim seat (the second hit and
+/// the stager's first hit) count seats instead (`+0` .. `+1`). The caster's one
+/// stage pose is raw row 6, which already is the pooled row.
+pub fn edits_966() -> Vec<ModuleEdit> {
+    let l = layout();
+    let mut v = site_edits(ESM_SITES);
     v.push(ModuleEdit {
         va: ESM_CUE_SITE_VA,
         expect: m::jal(CUE_FN_VA),
@@ -1050,6 +1098,84 @@ pub fn edits_951() -> Vec<ModuleEdit> {
     v
 }
 
+/// PROT 963 (Genocidal Cannon, `0xB3`) edits. Retail's cannon strikes the
+/// whole party: the victim row is hidden (arm 1), struck (arm 12) and shown
+/// again (arms 11 / 12 / 14 / 17 and the show at arm 8) by loops over
+/// `actor_table[0 .. ctx[+0]]`, each pointed at the opposite side like
+/// Evil Seru Magic's; the damage loop counts seats. The caster stages raw row 8
+/// (row `0x0A`) and, like Chaos Flare, retimes its own clip's hold window
+/// through the first monster's record (four reads, redirected to the caster's
+/// row-A entry); the stager that seats the flares reads `actor_table[3]` (two
+/// reads, redirected to the caster); and the last arm writes the first
+/// monster's readef group byte (`0x1C`), which would re-point the *enemy's*
+/// next stream, so it is dropped.
+pub fn edits_963() -> Vec<ModuleEdit> {
+    let l = layout();
+    let mut v = site_edits(GC_SITES);
+    let ed = |va, expect, replace| ModuleEdit {
+        va,
+        expect,
+        replace,
+    };
+    v.push(ed(
+        0x801F_6EB8,
+        m::addiu(V1, ZERO, 8),
+        m::addiu(V1, ZERO, u16::from(STAGE_ROW_A)),
+    ));
+    v.push(ed(GC_CUE_SITE_VA, m::jal(CUE_FN_VA), m::j(l.guard_963)));
+    let (lw_v1, lw_v0_a1, lw_v0_a0) = (
+        m::lw(V1, V0, 0x6C),
+        m::lw(V0, A1, 0x9348),
+        m::lw(V0, A0, 0x9348),
+    );
+    for (site, expect) in [
+        (0x801F_6ED4u32, lw_v0_a1),
+        (0x801F_6EE8, lw_v0_a1),
+        (0x801F_71D0, lw_v0_a0),
+        (0x801F_71E4, lw_v0_a0),
+    ] {
+        v.push(ed(site, expect, m::jal(l.cf_entry)));
+        v.push(ed(site + 8, lw_v1, m::nop()));
+    }
+    v.push(ed(0x801F_80F8, m::sb(V0, V1, 0x1C), m::nop()));
+    for site in [0x801F_8218u32, 0x801F_8300] {
+        v.push(ed(site, m::addiu(V1, V1, 0x9370), m::jal(l.caster_cell)));
+    }
+    v
+}
+
+const GC_SITES: &[(u32, u32, Site)] = &[
+    (0x801F6BE4, 0x90420000, Site::LbuCount(V0)),
+    (0x801F6BF8, 0x3C02801D, Site::LwBase(V1)),
+    (0x801F6BFC, 0x24439370, Site::Nop),
+    (0x801F6C20, 0x90420000, Site::LbuCount(V0)),
+    (0x801F78B4, 0x90420000, Site::LbuCount(V0)),
+    (0x801F78D0, 0x3C02801D, Site::LwBase(V1)),
+    (0x801F78D4, 0x24439370, Site::Nop),
+    (0x801F78F8, 0x90420000, Site::LbuCount(V0)),
+    (0x801F7C00, 0x90420000, Site::LbuEnd(V0)),
+    (0x801F7C0C, 0x00009021, Site::LbuStart(S2)),
+    (0x801F7C10, 0x3C02801D, Site::LwBase(S3)),
+    (0x801F7C14, 0x24539370, Site::Nop),
+    (0x801F7D3C, 0x90420000, Site::LbuEnd(V0)),
+    (0x801F7D8C, 0x90420000, Site::LbuCount(V0)),
+    (0x801F7DA0, 0x3C02801D, Site::LwBase(V1)),
+    (0x801F7DA4, 0x24439370, Site::Nop),
+    (0x801F7DBC, 0x90420000, Site::LbuCount(V0)),
+    (0x801F7EDC, 0x90420000, Site::LbuCount(V0)),
+    (0x801F7EEC, 0x3C02801D, Site::LwBase(V1)),
+    (0x801F7EF0, 0x24439370, Site::Nop),
+    (0x801F7F08, 0x90420000, Site::LbuCount(V0)),
+    (0x801F8020, 0x90620000, Site::LbuCount(V0)),
+    (0x801F802C, 0x3C02801D, Site::LwBase(V1)),
+    (0x801F8034, 0x24439370, Site::Nop),
+    (0x801F8058, 0x90420000, Site::LbuCount(V0)),
+    (0x801F8114, 0x90620000, Site::LbuCount(V0)),
+    (0x801F8130, 0x3C02801D, Site::LwBase(V1)),
+    (0x801F8134, 0x24439370, Site::Nop),
+    (0x801F8164, 0x90420000, Site::LbuCount(V0)),
+];
+
 /// Module PROT entry and edits for a spell.
 pub fn module_for(spell: u8) -> Option<(usize, Vec<ModuleEdit>)> {
     match spell {
@@ -1060,6 +1186,7 @@ pub fn module_for(spell: u8) -> Option<(usize, Vec<ModuleEdit>)> {
         SPELL_MYSTIC_SHIELD => Some((940, edits_940())),
         SPELL_EVIL_SERU => Some((966, edits_966())),
         SPELL_CHAOS_FLARE => Some((951, edits_951())),
+        SPELL_GENOCIDAL_CANNON => Some((963, edits_963())),
         _ => None,
     }
 }
@@ -1221,6 +1348,16 @@ pub fn install(
     }
     if readef_base != 0 && specials.iter().any(|s| s.spell == SPELL_CHAOS_FLARE) {
         changed |= write_scus(patcher, l.guard_951, &assemble_cf_guard())?;
+    }
+    if readef_base != 0 && specials.iter().any(|s| s.spell == SPELL_GENOCIDAL_CANNON) {
+        changed |= write_scus(patcher, l.guard_963, &assemble_gc_guard())?;
+        changed |= write_scus(patcher, l.caster_cell, &assemble_caster_cell())?;
+    }
+    if readef_base != 0
+        && specials
+            .iter()
+            .any(|s| matches!(s.spell, SPELL_CHAOS_FLARE | SPELL_GENOCIDAL_CANNON))
+    {
         changed |= write_scus(patcher, l.cf_entry, &assemble_cf_entry())?;
     }
     if readef_base != 0 && specials.iter().any(|s| s.spell == SPELL_EVIL_SERU) {
@@ -1627,6 +1764,8 @@ mod tests {
             assemble_esm_guard(),
             assemble_cf_guard(),
             assemble_cf_entry(),
+            assemble_gc_guard(),
+            assemble_caster_cell(),
         ] {
             assert!(crate::hazard::load_hazards(&words(&code)).is_empty());
         }
@@ -1646,14 +1785,16 @@ mod tests {
         ] {
             assert!((va + code.len() as u32) <= HOOK_END_VA);
         }
-        // Chaos Flare's entry loader sits in the gap before the shield store
-        assert!(l.shield_finisher + assemble_shield_finisher(&l).len() as u32 <= l.cf_entry);
-        assert!(l.cf_entry + assemble_cf_entry().len() as u32 <= l.shield_store);
+        // Songi's third form shares the run with the shield routines (never
+        // installed together): its four routines fit in it, in order
+        assert!(l.guard_951 + assemble_cf_guard().len() as u32 <= l.guard_963);
+        assert!(l.guard_963 + assemble_gc_guard().len() as u32 <= l.cf_entry);
+        assert!(l.cf_entry + assemble_cf_entry().len() as u32 <= l.caster_cell);
+        assert!(l.caster_cell + assemble_caster_cell().len() as u32 <= l.shield_pass);
         // the guards and the stand-in table sit behind them
         assert!(l.shield_pass + assemble_shield_pass(&l).len() as u32 <= l.guard_938);
         assert!(l.guard_938 + assemble_mc_guard().len() as u32 <= l.guard_966);
-        assert!(l.guard_966 + assemble_esm_guard().len() as u32 <= l.guard_951);
-        assert!(l.guard_951 + assemble_cf_guard().len() as u32 <= l.esm_dummy);
+        assert!(l.guard_966 + assemble_esm_guard().len() as u32 <= l.esm_dummy);
         assert!(l.esm_dummy + assemble_esm_dummy(&l).len() as u32 <= HOOK_END_VA);
         // the routines do not overlap
         assert!(l.hook + assemble_readef_request(&l).len() as u32 <= l.shield_finisher);

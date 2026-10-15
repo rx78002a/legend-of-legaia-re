@@ -466,6 +466,7 @@ fn borrowed_spells(monster: u16) -> &'static [u8] {
             module_cast::SPELL_MYSTIC_CIRCLE,
             module_cast::SPELL_EVIL_SERU,
         ],
+        179 => &[module_cast::SPELL_GENOCIDAL_CANNON],
         _ => &[],
     }
 }
