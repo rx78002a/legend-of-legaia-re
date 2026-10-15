@@ -531,3 +531,67 @@ fn a_big_monster_raises_the_party_mesh_work_buffer() {
     let w = u32::from_le_bytes(scus[off..off + 4].try_into().unwrap());
     assert_eq!(w, m::ori(5, 5, 0x9000));
 }
+
+#[test]
+fn juggernaut_routes_final_crisis() {
+    let Some(image) = disc() else { return };
+    let mut p = DiscPatcher::open(image).expect("open disc");
+    apply(
+        &mut p,
+        &Options {
+            monster: 181,
+            ..Options::default()
+        },
+    )
+    .expect("apply boss swap");
+    let l = module_cast::layout();
+    let scus = p.read_named_file("SCUS_942.54").unwrap();
+    let off = |va: u32| legaia_game_tables::item_names::file_offset_for_va(&scus, va).unwrap();
+    // Final Crisis rides Somersault and asks for the boss's texture group
+    assert_eq!(scus[off(l.table) + 0x27 - 0x10], 0xB4);
+    assert_eq!(&scus[off(l.rows)..][..2], &[0xB4, 1]);
+    let m961 = p.read_entry(961).unwrap();
+    let edits = module_cast::edits_961();
+    assert!(edits.len() > 20);
+    for e in &edits {
+        assert_eq!(word(&m961, e.va), e.replace, "961 {:#x}", e.va);
+    }
+    // no formation read survives: the module always takes the evolved Cort's
+    // branch
+    let ws: Vec<u32> = m961
+        .chunks(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let tick_end = ((0x801F_78A4u32 - 0x801F_69D8) / 4) as usize;
+    assert!(
+        ws[..tick_end]
+            .iter()
+            .all(|&w| w & 0xFC00_FFFF != 0x9000_BD0C),
+        "a formation read is left in the tick body"
+    );
+    for e in &edits {
+        let i = ((e.va - 0x801F_69D8) / 4) as usize;
+        let lo = i.saturating_sub(1);
+        let hi = (i + 3).min(ws.len());
+        for h in legaia_boss_swap::hazard::load_hazards(&ws[lo..hi]) {
+            let at = lo + h;
+            assert!(
+                !(at == i || at + 1 == i),
+                "load-delay hazard at {:#x}",
+                0x801F_69D8 + at as u32 * 4
+            );
+        }
+    }
+    // the host stops farther from its target (retail reach 43)
+    let reach = off(0x8007_8878);
+    assert_eq!(i16::from_le_bytes([scus[reach], scus[reach + 1]]), 43 - 256);
+    let guard = module_cast::assemble_fc_guard();
+    assert_eq!(&scus[off(l.guard_961)..][..guard.len()], guard.as_slice());
+    // the pose is the pooled row: no row-A stage entry for this build
+    assert_eq!(
+        module_cast::stage_entries(module_cast::SPELL_FINAL_CRISIS)
+            .unwrap()
+            .row_a,
+        None
+    );
+}

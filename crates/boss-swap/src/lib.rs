@@ -35,6 +35,15 @@ pub struct Options {
     /// host's own moves); `0` picks [`default_rate_div`]. Frame-indexed head
     /// fields (hit events, effects, cues) do not move: the clip lasts longer.
     pub rate_div: u32,
+    /// Ticks the last pose of every attack clip is held before the next move
+    /// starts (a chain's pause between strikes); `0` picks
+    /// [`default_attack_pause`].
+    pub attack_pause: u32,
+    /// The host's reach offset (`DAT_80078878[0]`, Vahn's): a battle walk stops
+    /// when `reach + distance` falls below the target's size threshold, so a
+    /// more negative value stops the attacker farther away. `None` picks
+    /// [`default_reach`]; retail is `43`.
+    pub reach: Option<i16>,
     /// The art record (by inline name) that plays the boss's cast - its
     /// fireball - instead of a melee move (stage 1: the art walks up first).
     /// `None` keeps melee in every art.
@@ -75,6 +84,8 @@ impl Default for Options {
             monster: 76,
             scale: 0.0,
             rate_div: 0,
+            attack_pause: 0,
+            reach: None,
             fireball_art: None,
             fireball_swing: true,
             direct_cast: true,
@@ -120,12 +131,47 @@ const DECIMATE_CAPS: [(Option<usize>, usize, usize); 14] = [
 /// the heap has room for (`docs/subsystems/battle.md`, the battle heap budget).
 const MEMBER_GROWN_LIMIT: usize = 0x1F000;
 
+/// Write Vahn's reach offset (`DAT_80078878[0]`, an `i16`).
+fn set_host_reach(patcher: &mut DiscPatcher, reach: i16) -> Result<()> {
+    const VA: u32 = 0x8007_8878;
+    let scus = patcher
+        .read_named_file("SCUS_942.54")
+        .context("read SCUS_942.54")?;
+    let off = legaia_game_tables::item_names::file_offset_for_va(&scus, VA)
+        .context("resolve the reach table")?;
+    let cur = i16::from_le_bytes([scus[off], scus[off + 1]]);
+    if cur != 43 && cur != reach {
+        bail!("reach table at {VA:#010x} holds {cur}, expected the retail 43");
+    }
+    patcher.patch_named_file("SCUS_942.54", off as u64, &reach.to_le_bytes())?;
+    Ok(())
+}
+
 /// How much a monster's fast clips are slowed (see [`Options::rate_div`]).
 /// Cort Juggernaut's strikes are authored at two poses per tick.
 pub fn default_rate_div(monster: u16) -> u32 {
     match monster {
         181 => 2,
         _ => 1,
+    }
+}
+
+/// Hold on the last pose of an attack clip, in ticks.
+pub fn default_attack_pause(monster: u16) -> u32 {
+    match monster {
+        181 => 14,
+        _ => 0,
+    }
+}
+
+/// The host's reach offset. A walk stops at `threshold(target size) - reach`;
+/// a boss's own retail walk stops at `threshold(its own size)`, so a large boss
+/// is given the difference (Cort Juggernaut, size byte `0x22`, against a
+/// typical `0x12` target: 256 units farther).
+pub fn default_reach(monster: u16) -> Option<i16> {
+    match monster {
+        181 => Some(43 - 256),
+        _ => None,
     }
 }
 
@@ -227,6 +273,21 @@ fn apply_with(
         0 => default_rate_div(opts.monster),
         d => d,
     };
+    let pause = match opts.attack_pause {
+        0 => default_attack_pause(opts.monster),
+        p => p,
+    };
+    if pause > 0 {
+        for c in &mut clips {
+            let n = c.len();
+            // an attack (it has hit events) not already holding a pose
+            if !c.events().is_empty() && c.head[0x84] == 0 && n > 1 {
+                c.head[0x84] = pause.min(255) as u8;
+                c.head[0x85] = (n - 1).min(255) as u8;
+                c.head[0x86] = n.min(255) as u8;
+            }
+        }
+    }
     if rate_div > 1 {
         for c in &mut clips {
             let rate = u32::from(c.head[0x78]);
@@ -412,6 +473,12 @@ fn apply_with(
             place.sectors
         ));
     }
+    if let Some(reach) = opts.reach.or_else(|| default_reach(opts.monster)) {
+        set_host_reach(patcher, reach)?;
+        report
+            .notes
+            .push(format!("host reach offset set to {reach} (retail 43)"));
+    }
     if b.worst_member_bytes > boss::MEMBER_ALLOC {
         let size = module_cast::grow_member_alloc(patcher, b.worst_member_bytes)?;
         report.notes.push(format!(
@@ -512,6 +579,7 @@ fn borrowed_spells(monster: u16) -> &'static [u8] {
             module_cast::SPELL_EVIL_SERU,
         ],
         179 => &[module_cast::SPELL_GENOCIDAL_CANNON],
+        181 => &[module_cast::SPELL_FINAL_CRISIS],
         _ => &[],
     }
 }

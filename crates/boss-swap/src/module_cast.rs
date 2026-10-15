@@ -51,8 +51,8 @@ use legaia_code_hooks::arenas::{
     ARENA1_END_VA, ARENA1_VA, ARENA2_END_VA, ARENA2_VA, SCUS_GAP_END_VA, SCUS_GAP_VA,
 };
 use legaia_code_hooks::mips::{
-    self as m, A0, A1, A2, GP, RA, S0, S2, S3, S5, SP, T0, T1, T2, T3, T4, T5, T6, T7, T8, V0, V1,
-    ZERO,
+    self as m, A0, A1, A2, A3, GP, RA, S0, S1, S2, S3, S5, SP, T0, T1, T2, T3, T4, T5, T6, T7, T8,
+    V0, V1, ZERO,
 };
 use legaia_disc_patch::disc::DiscPatcher;
 
@@ -94,6 +94,9 @@ pub const SPELL_EVIL_SERU: u8 = 0xAD;
 pub const SPELL_CHAOS_FLARE: u8 = 0x36;
 /// Songi's third form: Genocidal Cannon (PROT 963, tick body `0x801F6A20`).
 pub const SPELL_GENOCIDAL_CANNON: u8 = 0xB3;
+/// Cort Juggernaut's Final Crisis (PROT 961, tick body `0x801F69D8`; the same
+/// body serves Dead End Crisis `0xA1`).
+pub const SPELL_FINAL_CRISIS: u8 = 0xB4;
 
 /// Specials whose effects draw from the texture bank of the boss's own readef
 /// group (Cort's rune circle, the Juggernaut and the shield; Songi's flame):
@@ -106,6 +109,7 @@ pub fn needs_group(spell: u8) -> bool {
             | SPELL_EVIL_SERU
             | SPELL_CHAOS_FLARE
             | SPELL_GENOCIDAL_CANNON
+            | SPELL_FINAL_CRISIS
     )
 }
 
@@ -113,7 +117,9 @@ pub fn needs_group(spell: u8) -> bool {
 /// Somersault, Hyper Elbow and Slash Kick.
 pub fn default_constant(spell: u8) -> Option<u8> {
     match spell {
-        SPELL_HYPER_CRUSH | SPELL_GUILTY_CROSS | SPELL_CHAOS_FLARE => Some(0x27),
+        SPELL_HYPER_CRUSH | SPELL_GUILTY_CROSS | SPELL_CHAOS_FLARE | SPELL_FINAL_CRISIS => {
+            Some(0x27)
+        }
         SPELL_HYPER_LIGHTNING | SPELL_MYSTIC_CIRCLE | SPELL_GENOCIDAL_CANNON => Some(0x29),
         SPELL_MYSTIC_SHIELD => Some(0x26),
         SPELL_EVIL_SERU => Some(0x28),
@@ -162,6 +168,8 @@ pub fn stage_entries(spell: u8) -> Option<StageEntries> {
         SPELL_MYSTIC_SHIELD => (None, None),
         // Evil Seru Magic stages raw row 6 once (the pooled row) and row 0
         SPELL_EVIL_SERU => (None, Some(0x06)),
+        // Final Crisis stages raw row 6 once (the Juggernaut's first cast clip)
+        SPELL_FINAL_CRISIS => (None, Some(0x06)),
         _ => return None,
     };
     Some(StageEntries { row_a, pooled })
@@ -208,6 +216,9 @@ pub struct Layout {
     pub cf_entry: u32,
     pub caster_cell: u32,
     pub guard_963: u32,
+    /// Final Crisis's voice guard (shares the run with Chaos Flare's, which a
+    /// Juggernaut build never installs).
+    pub guard_961: u32,
     /// Evil Seru Magic's stand-in record[0] table (see [`assemble_esm_dummy`]).
     pub esm_dummy: u32,
 }
@@ -229,6 +240,7 @@ pub fn layout() -> Layout {
         guard_966: HOOK_VA + 0x19C,
         guard_951: HOOK_VA + 0x80,
         guard_963: HOOK_VA + 0xB4,
+        guard_961: HOOK_VA + 0x80,
         cf_entry: HOOK_VA + 0xE8,
         caster_cell: HOOK_VA + 0x118,
         esm_dummy: HOOK_VA + 0x208,
@@ -628,6 +640,13 @@ const GC_CUE_SITE_VA: u32 = 0x801F_6AD4;
 const GC_CUE_RESUME_VA: u32 = 0x801F_6ADC;
 const GC_EPILOGUE_VA: u32 = 0x801F_8178;
 const GC_CUE_ID: u16 = 0x1B4;
+const FC_CUE_SITE_VA: u32 = 0x801F_6AD4;
+const FC_CUE_RESUME_VA: u32 = 0x801F_6ADC;
+const FC_EPILOGUE_VA: u32 = 0x801F_7870;
+/// The cue Final Crisis plays in the formation it is authored for (the evolved
+/// Cort's, `0xB5`); every formation-dependent read of the module is forced to
+/// that branch (see [`edits_961`]).
+const FC_CUE_ID: u16 = 0x1C1;
 
 /// A cast whose texture group was requested from the route stub starts while
 /// the stream is still reading the CD, and the opening voice cue (CD-XA on the
@@ -661,6 +680,10 @@ pub fn assemble_mc_guard() -> Vec<u8> {
 
 pub fn assemble_cf_guard() -> Vec<u8> {
     assemble_cue_guard(CF_CUE_ID, CF_CUE_RESUME_VA, CF_EPILOGUE_VA)
+}
+
+pub fn assemble_fc_guard() -> Vec<u8> {
+    assemble_cue_guard(FC_CUE_ID, FC_CUE_RESUME_VA, FC_EPILOGUE_VA)
 }
 
 pub fn assemble_gc_guard() -> Vec<u8> {
@@ -1098,6 +1121,73 @@ pub fn edits_951() -> Vec<ModuleEdit> {
     v
 }
 
+/// The formation id the module tests (`0x8007BD0C`, a byte) for the evolved
+/// Cort's fight (`0xB5`); in any other formation the same body is Dead End
+/// Crisis, which sets every victim's HP to zero. Each of its ten reads becomes
+/// the constant `0xB5`, so the damage roll, the camera depths and the voice
+/// are the evolved Cort's wherever the cast happens.
+const FC_FORMATION_READS: [(u32, u32, u32); 10] = [
+    (0x801F_6AC0, 0x9043_BD0C, V1),
+    (0x801F_6C08, 0x9043_BD0C, V1),
+    (0x801F_6D3C, 0x9043_BD0C, V1),
+    (0x801F_6E78, 0x92A2_BD0C, V0),
+    (0x801F_6F30, 0x92A2_BD0C, V0),
+    (0x801F_6FEC, 0x92A3_BD0C, V1),
+    (0x801F_7140, 0x9043_BD0C, V1),
+    (0x801F_7390, 0x9043_BD0C, V1),
+    (0x801F_7590, 0x9047_BD0C, A3),
+    (0x801F_784C, 0x9043_BD0C, V1),
+];
+
+const FC_SITES: &[(u32, u32, Site)] = &[
+    // the damage loop (phase 3): count, first seat, first cell, end seat
+    (0x801F7348, 0x90820000, Site::LbuCount(V0)),
+    (0x801F7354, 0x00008821, Site::LbuStart(S1)),
+    (0x801F7358, 0x03C09821, Site::LwBase(S2)),
+    (0x801F7424, 0x90420000, Site::LbuEnd(V0)),
+];
+
+/// PROT 961 (Final Crisis, `0xB4`) edits. Retail's finale is cast by the first
+/// monster (seat 3) on the party (seats 0..2): its phase 0 pulls the party
+/// under the floor and turns seat 3 to the camera, phases 4 and 5 slow seats
+/// 0..2, phase `0xFF` puts the four seats back, and the damage loop strikes
+/// `actor_table[0 .. ctx[+0]]`. Everything but the damage hangs off the
+/// *caster*, so a party caster needs only: the damage loop pointed at the
+/// enemy row (count from the sweep scratch `+3`, absolute seats `+0 .. +1`,
+/// first cell `+8`; the `move s3,fp` it displaced goes one word down); the
+/// seat shuffle skipped (phase 0's four-seat loop and phase `0xFF`'s restore:
+/// the caster stays where it stands); the slow-down of seats 1 and 2 aimed at
+/// the caster (a party of one has no such seats, and the write would land on a
+/// null pointer); the ten formation reads forced to `0xB5`; and the voice
+/// cue guarded like the other modules'. The caster's pose is raw row 6, which
+/// already is the pooled row.
+pub fn edits_961() -> Vec<ModuleEdit> {
+    let l = layout();
+    let ed = |va, expect, replace| ModuleEdit {
+        va,
+        expect,
+        replace,
+    };
+    let mut v = site_edits(FC_SITES);
+    v.push(ed(0x801F_735C, 0x0280_9021, 0x03C0_9821)); // move s2,s4 -> move s3,fp
+    for (va, expect, reg) in FC_FORMATION_READS {
+        v.push(ed(va, expect, m::addiu(reg, ZERO, 0xB5)));
+    }
+    v.push(ed(0x801F_6AE4, 0x0100_2021, m::j(0x801F_6BD8)));
+    v.push(ed(0x801F_77D4, 0x3C02_8020, m::j(0x801F_7830)));
+    let to_caster = m::addu(V1, S2, ZERO);
+    for (va, expect) in [
+        (0x801F_744C, 0x8E83_0004),
+        (0x801F_7458, 0x8E83_0008),
+        (0x801F_752C, 0x8E83_0004),
+        (0x801F_7538, 0x8E83_0008),
+    ] {
+        v.push(ed(va, expect, to_caster));
+    }
+    v.push(ed(FC_CUE_SITE_VA, m::jal(CUE_FN_VA), m::j(l.guard_961)));
+    v
+}
+
 /// PROT 963 (Genocidal Cannon, `0xB3`) edits. Retail's cannon strikes the
 /// whole party: the victim row is hidden (arm 1), struck (arm 12) and shown
 /// again (arms 11 / 12 / 14 / 17 and the show at arm 8) by loops over
@@ -1187,6 +1277,7 @@ pub fn module_for(spell: u8) -> Option<(usize, Vec<ModuleEdit>)> {
         SPELL_EVIL_SERU => Some((966, edits_966())),
         SPELL_CHAOS_FLARE => Some((951, edits_951())),
         SPELL_GENOCIDAL_CANNON => Some((963, edits_963())),
+        SPELL_FINAL_CRISIS => Some((961, edits_961())),
         _ => None,
     }
 }
@@ -1366,6 +1457,9 @@ pub fn install(
     }
     if readef_base != 0 && specials.iter().any(|s| s.spell == SPELL_CHAOS_FLARE) {
         changed |= write_scus(patcher, l.guard_951, &assemble_cf_guard())?;
+    }
+    if readef_base != 0 && specials.iter().any(|s| s.spell == SPELL_FINAL_CRISIS) {
+        changed |= write_scus(patcher, l.guard_961, &assemble_fc_guard())?;
     }
     if readef_base != 0 && specials.iter().any(|s| s.spell == SPELL_GENOCIDAL_CANNON) {
         changed |= write_scus(patcher, l.guard_963, &assemble_gc_guard())?;

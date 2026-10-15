@@ -246,3 +246,58 @@ fn record_spells() {
         println!("monster {id}: {described:?}");
     }
 }
+
+#[test]
+#[ignore]
+fn spell_by_name() {
+    let Some(path) = std::env::var_os("LEGAIA_DISC_BIN") else {
+        return;
+    };
+    let p = DiscPatcher::open(std::fs::read(path).unwrap()).unwrap();
+    let scus = p.read_named_file("SCUS_942.54").unwrap();
+    let table = legaia_game_tables::spell_names::SpellNameTable::from_scus(&scus).unwrap();
+    let want = std::env::var("PROBE_NAME").unwrap().to_lowercase();
+    let off = legaia_game_tables::item_names::file_offset_for_va(&scus, 0x8007_54C8).unwrap();
+    for id in 0..=255u8 {
+        if let Some(n) = table.name(id)
+            && n.to_lowercase().contains(&want)
+        {
+            let rec = &scus[off + id as usize * 12..off + id as usize * 12 + 12];
+            println!("spell {id:#x} {n:?} stats {rec:02x?}");
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn dump_entries() {
+    let Some(path) = std::env::var_os("LEGAIA_DISC_BIN") else {
+        return;
+    };
+    let out = std::env::var("PROBE_OUT").unwrap();
+    let p = DiscPatcher::open(std::fs::read(path).unwrap()).unwrap();
+    for id in std::env::var("PROBE_ENTRIES").unwrap().split(',') {
+        let id: usize = id.parse().unwrap();
+        std::fs::write(format!("{out}/e{id}.bin"), p.read_entry(id).unwrap()).unwrap();
+    }
+}
+
+#[test]
+#[ignore]
+fn record_sizes() {
+    let Some(path) = std::env::var_os("LEGAIA_DISC_BIN") else {
+        return;
+    };
+    let p = DiscPatcher::open(std::fs::read(path).unwrap()).unwrap();
+    let scus = p.read_named_file("SCUS_942.54").unwrap();
+    let archive = p.read_entry_footprint(867).unwrap();
+    let off = legaia_game_tables::item_names::file_offset_for_va(&scus, 0x8007_8870).unwrap();
+    println!("DAT_80078870..: {:02x?}", &scus[off..off + 0x20]);
+    for id in std::env::var("PROBE_IDS").unwrap().split(',') {
+        let id: u16 = id.parse().unwrap();
+        let b = monster_archive::decode_block(&archive, id)
+            .unwrap()
+            .unwrap();
+        println!("monster {id}: size byte +0x1F = {:#x}", b[0x1F]);
+    }
+}

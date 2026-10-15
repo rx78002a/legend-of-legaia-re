@@ -39,6 +39,14 @@ fn main() -> Result<()> {
                 opts.scale = args.get(i + 1).context("--scale F")?.parse()?;
                 i += 2;
             }
+            "--attack-pause" => {
+                opts.attack_pause = args.get(i + 1).context("--attack-pause N")?.parse()?;
+                i += 2;
+            }
+            "--reach" => {
+                opts.reach = Some(args.get(i + 1).context("--reach N")?.parse()?);
+                i += 2;
+            }
             "--rate-div" => {
                 opts.rate_div = args.get(i + 1).context("--rate-div N")?.parse()?;
                 i += 2;
