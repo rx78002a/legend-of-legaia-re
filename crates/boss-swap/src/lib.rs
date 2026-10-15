@@ -9,6 +9,7 @@ pub mod direct_cast;
 pub mod hazard;
 pub mod module_cast;
 pub mod render;
+pub mod voice;
 
 use anyhow::{Context, Result, bail};
 use legaia_actor_formats::{battle_char_assembly, me_archive};
@@ -43,6 +44,8 @@ pub struct Options {
     /// keeps its resolution while any other part can give some up; empty picks
     /// [`default_protect`].
     pub protect_parts: Vec<usize>,
+    /// Give the host the boss's own grunts, cries and steps (see [`voice`]).
+    pub voices: bool,
     /// The host's reach offset (`DAT_80078878[0]`, Vahn's): a battle walk stops
     /// when `reach + distance` falls below the target's size threshold, so a
     /// more negative value stops the attacker farther away. `None` picks
@@ -90,6 +93,7 @@ impl Default for Options {
             rate_div: 0,
             attack_pause: 0,
             protect_parts: Vec::new(),
+            voices: true,
             reach: None,
             fireball_art: None,
             fireball_swing: true,
@@ -302,6 +306,12 @@ fn apply_with(
             }
         }
     }
+    // the boss's own voice: rewrites the clips' cue tracks, writes later
+    let voice_plan = if opts.voices {
+        voice::plan(patcher, opts.monster, &mut clips)?
+    } else {
+        None
+    };
     if rate_div > 1 {
         for c in &mut clips {
             let rate = u32::from(c.head[0x78]);
@@ -581,6 +591,10 @@ fn apply_with(
     }
     if opts.mute_host_voice {
         mute_vahn_voice(patcher, &mut report)?;
+    }
+    if let Some(plan) = &voice_plan {
+        voice::commit(patcher, plan)?;
+        report.notes.extend(plan.notes());
     }
     Ok(report)
 }

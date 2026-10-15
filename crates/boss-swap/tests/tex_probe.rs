@@ -301,3 +301,145 @@ fn record_sizes() {
         println!("monster {id}: size byte +0x1F = {:#x}", b[0x1F]);
     }
 }
+
+#[test]
+#[ignore]
+fn dump_scus() {
+    let Some(path) = std::env::var_os("LEGAIA_DISC_BIN") else {
+        return;
+    };
+    let p = DiscPatcher::open(std::fs::read(path).unwrap()).unwrap();
+    let scus = p.read_named_file("SCUS_942.54").unwrap();
+    std::fs::write(std::env::var("PROBE_OUT").unwrap(), scus).unwrap();
+}
+
+#[test]
+#[ignore]
+fn voice_cues() {
+    use legaia_container_formats::{bse_bank, vab_multi_bank};
+    let Some(path) = std::env::var_os("LEGAIA_DISC_BIN") else {
+        return;
+    };
+    let p = DiscPatcher::open(std::fs::read(path).unwrap()).unwrap();
+    let archive = p.read_entry_footprint(867).unwrap();
+    let bse = p.read_entry(888).unwrap();
+    let snd = p.read_entry_footprint(891).unwrap();
+    for id in std::env::var("PROBE_IDS").unwrap().split(',') {
+        let id: u16 = id.parse().unwrap();
+        println!("== monster {id}");
+        let clips = legaia_party_swap::playerize::boss::boss_clips_raw(&archive, id).unwrap();
+        let bank = vab_multi_bank::bank_bytes(&snd, usize::from(id) - 1);
+        let rep = bank.and_then(|b| legaia_vab::parse_in_stream(b, 0).ok());
+        if let Some(r) = &rep {
+            let progs: Vec<(usize, u8)> = r
+                .programs
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.tones > 0)
+                .map(|(i, p)| (i, p.tones))
+                .collect();
+            println!(
+                "bank: {} programs {:?}, {} vags {:?}",
+                progs.len(),
+                progs,
+                r.vag_samples.len(),
+                r.vag_samples.iter().map(|v| v.size).collect::<Vec<_>>()
+            );
+        } else {
+            println!("bank: none");
+        }
+        for c in &clips {
+            let h = &c.head;
+            let mut cues = Vec::new();
+            for o in (0x54..0x74).step_by(4) {
+                let f = u16::from_le_bytes([h[o], h[o + 1]]);
+                let cue = u16::from_le_bytes([h[o + 2], h[o + 3]]);
+                if cue != 0 {
+                    cues.push((f, cue));
+                }
+            }
+            println!(
+                "clip tag {:#04x} frames {:3} cues {cues:x?}",
+                c.tag,
+                c.len()
+            );
+            for &(_, cue) in &cues {
+                if cue >= 0x64 {
+                    let ring = cue + 0x19C;
+                    if let Some(r) = bse_bank::record_for_cue(&bse, ring) {
+                        println!(
+                            "   cue {cue:#x} -> ring {ring:#x} row p{} t{} l{} n{:#x} cat{}",
+                            r.program, r.tone, r.level, r.flags, r.category
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn battle_bank() {
+    let Some(path) = std::env::var_os("LEGAIA_DISC_BIN") else {
+        return;
+    };
+    let p = DiscPatcher::open(std::fs::read(path).unwrap()).unwrap();
+    let buf = p.read_entry(869).unwrap();
+    let offs = legaia_vab::find_vabs(&buf);
+    println!("entry 869: {} bytes, vabs at {offs:?}", buf.len());
+    for off in offs {
+        let r = legaia_vab::parse(&buf, off).unwrap();
+        println!("VAB at {off:#x}: ps {} vs {}", r.header.ps, r.header.vs);
+        for (i, pr) in r.programs.iter().enumerate().filter(|(_, p)| p.tones > 0) {
+            println!("  program {i}: tones {}", pr.tones);
+        }
+        let mut page = 0;
+        for (i, pr) in r.programs.iter().enumerate().filter(|(_, p)| p.tones > 0) {
+            for (t, tone) in r.tones[page].iter().take(pr.tones as usize).enumerate() {
+                println!(
+                    "    p{i} t{t}: vag {} vol {} center {} adsr {:04x}/{:04x}",
+                    tone.vag, tone.vol, tone.center, tone.adsr1, tone.adsr2
+                );
+            }
+            page += 1;
+        }
+        println!(
+            "  vags: {:?}",
+            r.vag_samples.iter().map(|v| v.size).collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+#[ignore]
+fn bse_rows() {
+    use legaia_container_formats::bse_bank;
+    let Some(path) = std::env::var_os("LEGAIA_DISC_BIN") else {
+        return;
+    };
+    let p = DiscPatcher::open(std::fs::read(path).unwrap()).unwrap();
+    let bse = p.read_entry(888).unwrap();
+    let scus = p.read_named_file("SCUS_942.54").unwrap();
+    for (i, r) in bse_bank::records(&bse).iter().enumerate() {
+        if (0x30..0x70).contains(&i) {
+            println!(
+                "bse row {i:#x} (party cue {:#x}) p{} t{} l{} n{:#x} cat{}",
+                i + 0x64,
+                r.program,
+                r.tone,
+                r.level,
+                r.flags,
+                r.category
+            );
+        }
+    }
+    let off = legaia_game_tables::item_names::file_offset_for_va(&scus, 0x8006_F198).unwrap();
+    for id in 0..0x64usize {
+        let r = &scus[off + id * 8..off + id * 8 + 8];
+        println!(
+            "static id {id:#x} (ring) p{} t{} l{} n{:#x} cat{}",
+            r[0], r[1], r[2], r[3], r[4]
+        );
+    }
+}

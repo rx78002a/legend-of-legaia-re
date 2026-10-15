@@ -48,6 +48,10 @@ fn main() -> Result<()> {
                     .push(args.get(i + 1).context("--protect-part N")?.parse()?);
                 i += 2;
             }
+            "--no-voices" => {
+                opts.voices = false;
+                i += 1;
+            }
             "--reach" => {
                 opts.reach = Some(args.get(i + 1).context("--reach N")?.parse()?);
                 i += 2;

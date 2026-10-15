@@ -282,11 +282,18 @@ fn apply_clip_head(entry: &mut [u8], clip: &BossClip, nframes: usize, kind: Kind
 /// First cue id that is not one of the static effect table's `0x00..=0x63`.
 const FIRST_FOREIGN_CUE: u16 = 0x64;
 
+/// The host's own voice cues, which a boss clip's cue track may carry past the
+/// strip of foreign ids: static rows `0x51..=0x56` and the party band rows
+/// `0xA7` / `0xA8`, the tones of the host's voice program (the `voice` module of
+/// `legaia-boss-swap` overwrites them with the boss's samples). Only ids below
+/// `0x64` pass the strip otherwise, so just the two band ids matter here.
+pub const HOST_VOICE_CUES: [u16; 2] = [0xA7, 0xA8];
+
 fn strip_voice_cues(cues: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(cues.len());
     for pair in cues.chunks_exact(4) {
         let id = u16::from_le_bytes([pair[2], pair[3]]);
-        if id >= FIRST_FOREIGN_CUE {
+        if id >= FIRST_FOREIGN_CUE && !HOST_VOICE_CUES.contains(&id) {
             continue;
         }
         if pair == [0, 0, 0, 0] {
