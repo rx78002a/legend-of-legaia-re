@@ -1295,7 +1295,9 @@ const DD_SITES: &[(u32, u32, Site)] = &[
 /// absolute seats (`+0 .. +1`) because the seat is the damage argument, so its
 /// arrangement index reads the scratch `+0x46` (`count - 1`: with the first
 /// seat at 3, `(count - 1) * 3 + seat` is `3 * count + i`). The module reads
-/// no formation id; the voice cue gets the stream guard.
+/// no formation id; the voice cue gets the stream guard, and phase `0xC` no
+/// longer waits for a dead victim's defeat state `8` (a monster's is another
+/// value, and the cast stood still on the last frame).
 pub fn edits_965() -> Vec<ModuleEdit> {
     let l = layout();
     let ed = |va, expect, replace| ModuleEdit {
@@ -1313,6 +1315,9 @@ pub fn edits_965() -> Vec<ModuleEdit> {
         m::addiu(V1, ZERO, 7),
         stage_imm(STAGE_ROW_B),
     ));
+    // Phase 0xC counts a dead victim as unsettled until its defeat state is
+    // 8 (the party's), which a monster never reaches: skip that test.
+    v.push(ed(0x801F_79D4, 0x1047_0002, 0x1000_0002)); // beq v0,a3 -> b
     v.push(ed(DD_CUE_SITE_VA, m::jal(CUE_FN_VA), m::j(l.guard_965)));
     v
 }
