@@ -30,6 +30,11 @@ pub struct Options {
     /// Uniform scale applied to the boss geometry and pose translations;
     /// `0` picks [`default_scale`].
     pub scale: f32,
+    /// Divisor for the playback rate of every clip that runs faster than one
+    /// pose per tick (a monster's quick strikes feel twice as fast as the
+    /// host's own moves); `0` picks [`default_rate_div`]. Frame-indexed head
+    /// fields (hit events, effects, cues) do not move: the clip lasts longer.
+    pub rate_div: u32,
     /// The art record (by inline name) that plays the boss's cast - its
     /// fireball - instead of a melee move (stage 1: the art walks up first).
     /// `None` keeps melee in every art.
@@ -69,6 +74,7 @@ impl Default for Options {
         Self {
             monster: 76,
             scale: 0.0,
+            rate_div: 0,
             fireball_art: None,
             fireball_swing: true,
             direct_cast: true,
@@ -112,7 +118,16 @@ const DECIMATE_CAPS: [(Option<usize>, usize, usize); 14] = [
 /// `boss::MEMBER_ALLOC`; a larger monster (Cort Juggernaut's geometry alone is
 /// 80 KB) raises that allocation up to this, which is a transient work buffer
 /// the heap has room for (`docs/subsystems/battle.md`, the battle heap budget).
-const MEMBER_GROWN_LIMIT: usize = 0x1C000;
+const MEMBER_GROWN_LIMIT: usize = 0x1F000;
+
+/// How much a monster's fast clips are slowed (see [`Options::rate_div`]).
+/// Cort Juggernaut's strikes are authored at two poses per tick.
+pub fn default_rate_div(monster: u16) -> u32 {
+    match monster {
+        181 => 2,
+        _ => 1,
+    }
+}
 
 /// The size a boss is built at. The first three builds that were played on
 /// hardware use `0.8`; every other monster keeps its own size (`1.0`), which is
@@ -208,6 +223,18 @@ fn apply_with(
     let base_n = me_archive::parse(slot_bytes(base_slot)?)?.len();
 
     let mut clips = boss::boss_clips(&archive, opts.monster)?;
+    let rate_div = match opts.rate_div {
+        0 => default_rate_div(opts.monster),
+        d => d,
+    };
+    if rate_div > 1 {
+        for c in &mut clips {
+            let rate = u32::from(c.head[0x78]);
+            if rate >= 2 {
+                c.head[0x78] = (rate / rate_div).max(1) as u8;
+            }
+        }
+    }
     let rec0 = boss::Record0::parse(&player)?;
     // The fireball needs a cast clip that ends in a move-power terminator. A
     // boss whose specials are cast-module cinematics has none: it plays its

@@ -275,13 +275,18 @@ fn apply_clip_head(entry: &mut [u8], clip: &BossClip, nframes: usize, kind: Kind
 /// Sound cues are `[u16 frame][u16 id]` pairs. For a party actor an id
 /// `>= 0x100` selects an XA voice line by position in the *party's* voice
 /// table, so a boss's own voice ids would play whatever party line sits at
-/// that slot - long, unrelated shouts. Drop those pairs and close the gap
-/// (a zero pair ends the list); the effect ids below `0x100` keep playing.
+/// that slot - long, unrelated shouts. Ids in `0x64..0x100` are past the static
+/// effect table and keep no meaning here either (Cort Juggernaut's walk cue
+/// `0xF1` played a party member's item line). Drop those pairs and close the
+/// gap (a zero pair ends the list); the effect ids below `0x64` keep playing.
+/// First cue id that is not one of the static effect table's `0x00..=0x63`.
+const FIRST_FOREIGN_CUE: u16 = 0x64;
+
 fn strip_voice_cues(cues: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(cues.len());
     for pair in cues.chunks_exact(4) {
         let id = u16::from_le_bytes([pair[2], pair[3]]);
-        if id >= 0x100 {
+        if id >= FIRST_FOREIGN_CUE {
             continue;
         }
         if pair == [0, 0, 0, 0] {
@@ -1196,6 +1201,7 @@ fn replace_swings(
 // Geometry
 
 /// The boss geometry laid into the party band.
+#[derive(Clone)]
 pub struct BossGeometry {
     pub channel_geom: BTreeMap<u8, ModelObject>,
     pub section_pools: Vec<Vec<u8>>,
@@ -1313,7 +1319,47 @@ fn aliased_canonical_objects(player_file: &[u8], rig: &PlayerRig) -> Result<Vec<
         .collect())
 }
 
+/// The geometry layout depends on the monster, the rig, the size and the
+/// downscale only, not on how the clips are decimated, and it is the costly
+/// part of a build that retries its decimation ladder: the layout is kept
+/// across those retries.
 pub fn boss_geometry(
+    player_file: &[u8],
+    rig: &PlayerRig,
+    archive: &[u8],
+    id: u16,
+    char_slot: usize,
+    downscale: u32,
+    scale: f32,
+) -> Result<BossGeometry> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<[u64; 6], BossGeometry>>> = OnceLock::new();
+    let fold = |b: &[u8]| {
+        b.chunks(8).fold(b.len() as u64, |h, c| {
+            let mut w = [0u8; 8];
+            w[..c.len()].copy_from_slice(c);
+            (h ^ u64::from_le_bytes(w)).wrapping_mul(0x100_0000_01B3)
+        })
+    };
+    let key = [
+        fold(player_file),
+        fold(archive),
+        u64::from(id),
+        char_slot as u64,
+        u64::from(downscale),
+        u64::from(scale.to_bits()),
+    ];
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(g) = cache.lock().unwrap().get(&key) {
+        return Ok(g.clone());
+    }
+    let g = boss_geometry_uncached(player_file, rig, archive, id, char_slot, downscale, scale)?;
+    cache.lock().unwrap().insert(key, g.clone());
+    Ok(g)
+}
+
+fn boss_geometry_uncached(
     player_file: &[u8],
     rig: &PlayerRig,
     archive: &[u8],
