@@ -194,6 +194,9 @@ pub struct Layout {
     pub guard_966: u32,
     /// Chaos Flare's voice guard.
     pub guard_951: u32,
+    /// Chaos Flare's loader of the caster's stage entry (see
+    /// [`assemble_cf_entry`]).
+    pub cf_entry: u32,
     /// Evil Seru Magic's stand-in record[0] table (see [`assemble_esm_dummy`]).
     pub esm_dummy: u32,
 }
@@ -207,14 +210,15 @@ pub fn layout() -> Layout {
         readef: ARENA2_VA + 0x44,
         hook: HOOK_VA,
         shield_finisher: HOOK_VA + 0x80,
-        shield_store: HOOK_VA + 0x100,
-        shield_caster: HOOK_VA + 0x120,
-        shield_pass: HOOK_VA + 0x150,
+        shield_store: HOOK_VA + 0x104,
+        shield_caster: HOOK_VA + 0x124,
+        shield_pass: HOOK_VA + 0x148,
         owner: ARENA2_VA + 0x45,
-        guard_938: HOOK_VA + 0x170,
-        guard_966: HOOK_VA + 0x1B0,
-        guard_951: HOOK_VA + 0x1F0,
-        esm_dummy: HOOK_VA + 0x230,
+        guard_938: HOOK_VA + 0x168,
+        guard_966: HOOK_VA + 0x19C,
+        guard_951: HOOK_VA + 0x1D0,
+        cf_entry: HOOK_VA + 0xD4,
+        esm_dummy: HOOK_VA + 0x208,
     }
 }
 
@@ -663,6 +667,32 @@ pub fn assemble_esm_dummy(l: &Layout) -> Vec<u8> {
     b
 }
 
+/// Chaos Flare retimes the caster's cast clip while it plays: it reaches the
+/// clip's entry through `*(0x801C9348) + 0x6C` (the first monster's record,
+/// entry 8) and writes its hold window (`+0x85` / `+0x86`): frames 12..17
+/// while the caster charges (arms crossed), then 21..23 for the release. On a
+/// party caster that chain leads into the *enemy's* record and the caster's
+/// own pose keeps its authored window. This returns, in `v1`, the entry
+/// pointer the caster's row `0x0A` holds, for a `jal` that replaces each
+/// `lw v0,-0x6CB8(a0)` (its delay slot is the `nop` after it, and the
+/// `lw v1,0x6C(v0)` that follows becomes a `nop`).
+pub fn assemble_cf_entry() -> Vec<u8> {
+    let mut a = Asm::new();
+    a.op(m::lui(T0, 0x8008));
+    a.op(m::lw(T0, T0, 0xBD24)); // ctx
+    a.op(m::lui(T1, m::hi(RECORD0_TABLE_VA)));
+    a.op(m::lbu(T0, T0, 0x13)); // caster seat
+    a.op(m::addiu(T1, T1, m::lo(RECORD0_TABLE_VA)));
+    a.op(m::sll(T0, T0, 2));
+    a.op(m::addu(T1, T1, T0));
+    a.op(m::lw(T1, T1, 0)); // record[0] base of the seat
+    a.op(m::nop());
+    a.op(m::lw(V1, T1, 4 * u16::from(STAGE_ROW_A))); // the row-A entry
+    a.op(m::jr(RA));
+    a.op(m::nop());
+    words_to_bytes(a.finish())
+}
+
 /// One expect-verified word edit inside a module image.
 #[derive(Debug, Clone, Copy)]
 pub struct ModuleEdit {
@@ -994,7 +1024,7 @@ pub fn edits_951() -> Vec<ModuleEdit> {
         expect,
         replace,
     };
-    vec![
+    let mut v = vec![
         ed(0x801F_6D60, 0x2402_0008, stage_imm(STAGE_ROW_A)),
         ed(
             0x801F_6E38,
@@ -1010,7 +1040,14 @@ pub fn edits_951() -> Vec<ModuleEdit> {
         ed(0x801F_6E54, m::addiu(V1, V0, 0x9370), m::nop()),
         ed(0x801F_6E80, 0x9042_0000, m::lbu(V0, GP, gp_off(1))),
         ed(CF_CUE_SITE_VA, m::jal(CUE_FN_VA), m::j(l.guard_951)),
-    ]
+    ];
+    // the caster's window retiming: four `lw v0,-0x6CB8(a0)` + `lw v1,0x6C(v0)`
+    let (lw_v0, lw_v1) = (m::lw(V0, A0, 0x9348), m::lw(V1, V0, 0x6C));
+    for site in [0x801F_6E98u32, 0x801F_6EAC, 0x801F_7214, 0x801F_7228] {
+        v.push(ed(site, lw_v0, m::jal(l.cf_entry)));
+        v.push(ed(site + 8, lw_v1, m::nop()));
+    }
+    v
 }
 
 /// Module PROT entry and edits for a spell.
@@ -1184,6 +1221,7 @@ pub fn install(
     }
     if readef_base != 0 && specials.iter().any(|s| s.spell == SPELL_CHAOS_FLARE) {
         changed |= write_scus(patcher, l.guard_951, &assemble_cf_guard())?;
+        changed |= write_scus(patcher, l.cf_entry, &assemble_cf_entry())?;
     }
     if readef_base != 0 && specials.iter().any(|s| s.spell == SPELL_EVIL_SERU) {
         changed |= write_scus(patcher, l.guard_966, &assemble_esm_guard())?;
@@ -1553,6 +1591,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn chaos_flare_reads_the_casters_row_a_entry() {
+        let mut cpu = Cpu::new();
+        let l = layout();
+        cpu.load(l.cf_entry, &assemble_cf_entry());
+        cpu.wr32(CTX_PTR_VA, CTX);
+        cpu.wr8(CTX + 0x13, 1);
+        cpu.wr32(RECORD0_TABLE_VA + 4, REC0);
+        cpu.wr32(REC0 + 0x28, REC0 + 0x1234); // row 0x0A
+        cpu.r[RA as usize] = RETURN_VA;
+        cpu.pc = l.cf_entry;
+        cpu.run_until(&[RETURN_VA]);
+        assert_eq!(cpu.r[V1 as usize], REC0 + 0x1234);
+    }
+
     fn words(b: &[u8]) -> Vec<u32> {
         b.chunks(4)
             .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
@@ -1573,6 +1626,7 @@ mod tests {
             assemble_mc_guard(),
             assemble_esm_guard(),
             assemble_cf_guard(),
+            assemble_cf_entry(),
         ] {
             assert!(crate::hazard::load_hazards(&words(&code)).is_empty());
         }
@@ -1592,6 +1646,9 @@ mod tests {
         ] {
             assert!((va + code.len() as u32) <= HOOK_END_VA);
         }
+        // Chaos Flare's entry loader sits in the gap before the shield store
+        assert!(l.shield_finisher + assemble_shield_finisher(&l).len() as u32 <= l.cf_entry);
+        assert!(l.cf_entry + assemble_cf_entry().len() as u32 <= l.shield_store);
         // the guards and the stand-in table sit behind them
         assert!(l.shield_pass + assemble_shield_pass(&l).len() as u32 <= l.guard_938);
         assert!(l.guard_938 + assemble_mc_guard().len() as u32 <= l.guard_966);

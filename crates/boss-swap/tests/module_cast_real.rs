@@ -464,4 +464,6 @@ fn songi_third_form_routes_chaos_flare() {
     }
     let guard = module_cast::assemble_cf_guard();
     assert_eq!(&scus[off(l.guard_951)..][..guard.len()], guard.as_slice());
+    let entry = module_cast::assemble_cf_entry();
+    assert_eq!(&scus[off(l.cf_entry)..][..entry.len()], entry.as_slice());
 }
