@@ -51,8 +51,8 @@ use legaia_code_hooks::arenas::{
     ARENA1_END_VA, ARENA1_VA, ARENA2_END_VA, ARENA2_VA, SCUS_GAP_END_VA, SCUS_GAP_VA,
 };
 use legaia_code_hooks::mips::{
-    self as m, A0, A1, A2, A3, GP, RA, S0, S1, S2, S3, S5, SP, T0, T1, T2, T3, T4, T5, T6, T7, T8,
-    V0, V1, ZERO,
+    self as m, A0, A1, A2, A3, GP, RA, S0, S1, S2, S3, S4, S5, SP, T0, T1, T2, T3, T4, T5, T6, T7,
+    T8, V0, V1, ZERO,
 };
 use legaia_disc_patch::disc::DiscPatcher;
 
@@ -1155,8 +1155,9 @@ const FC_SITES: &[(u32, u32, Site)] = &[
 /// *caster*, so a party caster needs only: the damage loop pointed at the
 /// enemy row (count from the sweep scratch `+3`, absolute seats `+0 .. +1`,
 /// first cell `+8`; the `move s3,fp` it displaced goes one word down); the
-/// seat shuffle skipped (phase 0's four-seat loop and phase `0xFF`'s restore:
-/// the caster stays where it stands); the slow-down of seats 1 and 2 aimed at
+/// seat shuffle cut to the caster's own iteration (phase 0's four-seat loop and
+/// phase `0xFF`'s restore, which seat the caster at the stage centre and put it
+/// back); the slow-down of seats 1 and 2 aimed at
 /// the caster (a party of one has no such seats, and the write would land on a
 /// null pointer); the ten formation reads forced to `0xB5`; and the voice
 /// cue guarded like the other modules'. The caster's pose is raw row 6, which
@@ -1173,8 +1174,31 @@ pub fn edits_961() -> Vec<ModuleEdit> {
     for (va, expect, reg) in FC_FORMATION_READS {
         v.push(ed(va, expect, m::addiu(reg, ZERO, 0xB5)));
     }
-    v.push(ed(0x801F_6AE4, 0x0100_2021, m::j(0x801F_6BD8)));
-    v.push(ed(0x801F_77D4, 0x3C02_8020, m::j(0x801F_7830)));
+    // Phase 0 saves each of the four seats and re-seats them, and phase `0xFF`
+    // puts them back, in do-while loops over `s1 = 0..3` whose pointers step a
+    // seat at a time. Only seat 3's iteration is kept (`s1 = 3`, every pointer
+    // advanced three steps), and it reads the *caster* (`s2`) wherever the
+    // loop read `actor_table[3]`: the caster is the one actor retail seats at
+    // the stage centre, facing the camera, and the burst effect is placed
+    // relative to that spot. Without it the caster stood off to one side.
+    let s2_to = |r: u32| m::addu(r, S2, ZERO);
+    let addi = |rt: u32, rs: u32, imm: i32| m::addiu(rt, rs, imm as u16);
+    v.push(ed(0x801F_6AD8, 0x0000_8821, addi(S1, ZERO, 3)));
+    v.push(ed(0x801F_6AE4, 0x0100_2021, addi(A0, T0, 12)));
+    v.push(ed(0x801F_6AEC, 0x2447_7628, addi(A3, V0, 0x7628 + 24)));
+    v.push(ed(0x801F_6AF4, 0x2446_82DC, addi(A2, V0, -0x7D24 + 6)));
+    v.push(ed(0x801F_6AFC, 0x2445_82BC, addi(A1, V0, -0x7D44 + 24)));
+    v.push(ed(0x801F_6B00, 0x8C82_0000, s2_to(V0)));
+    v.push(ed(0x801F_6B28, 0x8C82_0000, s2_to(V0)));
+    v.push(ed(0x801F_6B98, 0x8D03_000C, s2_to(V1)));
+    v.push(ed(0x801F_6BA4, 0x8D02_000C, s2_to(V0)));
+    v.push(ed(0x801F_6BB0, 0x8D03_000C, s2_to(V1)));
+    v.push(ed(0x801F_6AB4, 0x0000_8821, addi(S1, ZERO, 3)));
+    v.push(ed(0x801F_77D8, 0x2446_82DC, addi(A2, V0, -0x7D24 + 6)));
+    v.push(ed(0x801F_77DC, 0x0280_2021, addi(A0, S4, 12)));
+    v.push(ed(0x801F_77E4, 0x2445_82BC, addi(A1, V0, -0x7D44 + 24)));
+    v.push(ed(0x801F_77E8, 0x8C82_0000, s2_to(V0)));
+    v.push(ed(0x801F_7818, 0x8C82_0000, s2_to(V0)));
     let to_caster = m::addu(V1, S2, ZERO);
     for (va, expect) in [
         (0x801F_744C, 0x8E83_0004),
