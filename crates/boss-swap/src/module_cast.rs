@@ -1283,6 +1283,24 @@ fn patch_scus_word(patcher: &mut DiscPatcher, va: u32, expect: u32, replace: u32
     Ok(true)
 }
 
+/// The party-mesh assembler (`FUN_80052FA0`) allocates its work buffer with
+/// `lui a1,1; ori a1,a1,0x9000`. Raise it to hold `need` bytes (rounded up with
+/// a little headroom); returns the new size.
+pub fn grow_member_alloc(patcher: &mut DiscPatcher, need: usize) -> Result<u32> {
+    const SITE: u32 = 0x8005_301C;
+    let size = (need as u32 + 0x400).next_multiple_of(0x100);
+    if !(0x1_9000..0x2_0000).contains(&size) {
+        bail!("member buffer of {size:#x} bytes is outside what one `ori` can ask for");
+    }
+    patch_scus_word(
+        patcher,
+        SITE,
+        m::ori(5, 5, 0x9000),
+        m::ori(5, 5, (size & 0xFFFF) as u16),
+    )?;
+    Ok(size)
+}
+
 /// Patch the debit site of state `0x28` in the battle overlay.
 fn redirect_debit(patcher: &mut DiscPatcher, prep_va: u32) -> Result<bool> {
     let entry = patcher.read_entry(898)?;

@@ -1577,6 +1577,12 @@ pub fn bossize_player_file(
         &new_r0,
         hdr,
     )?;
+    if std::env::var_os("BOSS_DEBUG").is_some() {
+        eprintln!(
+            "MEMBER hdr0 {:#x} max_body {:x?} max_len {:x?} | retail clut_a {:#x} body {:x?} len {:x?}",
+            hdr[0], max_body, max_len, rec0.clut_a, old_body, old_len
+        );
+    }
     let worst = |clut_a: usize, body: &[usize; SECTION_COUNT], len: &[usize; SECTION_COUNT]| {
         clut_a + body[..SECTION_COUNT - 1].iter().sum::<usize>() + len[SECTION_COUNT - 1]
     };

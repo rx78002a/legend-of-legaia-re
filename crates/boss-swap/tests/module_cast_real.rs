@@ -497,3 +497,37 @@ fn songi_third_form_routes_chaos_flare() {
     let cell = module_cast::assemble_caster_cell();
     assert_eq!(&scus[off(l.caster_cell)..][..cell.len()], cell.as_slice());
 }
+
+#[test]
+fn a_big_monster_raises_the_party_mesh_work_buffer() {
+    let Some(bin) = disc() else { return };
+    // Cort Juggernaut: 19 parts, geometry alone over the retail 0x19000
+    let mut p = DiscPatcher::open(bin).unwrap();
+    let report = apply(
+        &mut p,
+        &Options {
+            monster: 181,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|n| n.contains("work buffer raised")),
+        "{:#?}",
+        report.notes
+    );
+    let scus = p.read_named_file("SCUS_942.54").unwrap();
+    let off = legaia_game_tables::item_names::file_offset_for_va(&scus, 0x8005_301C).unwrap();
+    let w = u32::from_le_bytes(scus[off..off + 4].try_into().unwrap());
+    assert_eq!(w >> 16, 0x34a5, "still `ori a1,a1,imm`");
+    assert!((w & 0xFFFF) > 0x9000, "the allocation grew: {w:#x}");
+    // a monster that fits keeps the retail allocation
+    let mut q = DiscPatcher::open(disc().unwrap()).unwrap();
+    apply(&mut q, &opts()).unwrap();
+    let scus = q.read_named_file("SCUS_942.54").unwrap();
+    let w = u32::from_le_bytes(scus[off..off + 4].try_into().unwrap());
+    assert_eq!(w, m::ori(5, 5, 0x9000));
+}

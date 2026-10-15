@@ -108,6 +108,12 @@ const DECIMATE_CAPS: [(Option<usize>, usize, usize); 14] = [
     (Some(12), 3, 3),
 ];
 
+/// The most member buffer a build may ask the loader for. Retail allocates
+/// `boss::MEMBER_ALLOC`; a larger monster (Cort Juggernaut's geometry alone is
+/// 80 KB) raises that allocation up to this, which is a transient work buffer
+/// the heap has room for (`docs/subsystems/battle.md`, the battle heap budget).
+const MEMBER_GROWN_LIMIT: usize = 0x1C000;
+
 /// The size a boss is built at. The first three builds that were played on
 /// hardware use `0.8`; every other monster keeps its own size (`1.0`), which is
 /// what a cast module's effects are authored for: they are anchored at the
@@ -132,8 +138,12 @@ pub fn apply(patcher: &mut DiscPatcher, opts: &Options) -> Result<Report> {
     }
     let opts = &resolved;
     let mut last = None;
-    for (cap, stage, pool) in DECIMATE_CAPS {
-        match apply_with(patcher, opts, cap, stage, pool) {
+    // first within the retail allocation, then growing it
+    let rungs = [boss::MEMBER_ALLOC, MEMBER_GROWN_LIMIT]
+        .into_iter()
+        .flat_map(|limit| DECIMATE_CAPS.map(|(cap, stage, pool)| (limit, cap, stage, pool)));
+    for (limit, cap, stage, pool) in rungs {
+        match apply_with(patcher, opts, cap, stage, pool, limit) {
             Ok(mut report) => {
                 if let Some(cap) = cap {
                     report.notes.push(format!(
@@ -156,7 +166,7 @@ pub fn apply(patcher: &mut DiscPatcher, opts: &Options) -> Result<Report> {
                     return Err(e);
                 }
                 if std::env::var_os("BOSS_DEBUG").is_some() {
-                    eprintln!("cap {cap:?} stage 1/{stage} pool 1/{pool}: {text}");
+                    eprintln!("limit {limit:#x} cap {cap:?} stage 1/{stage} pool 1/{pool}: {text}");
                 }
                 last = Some(e);
             }
@@ -171,6 +181,7 @@ fn apply_with(
     decimate_over: Option<usize>,
     decimate_stage: usize,
     decimate_pool: usize,
+    member_limit: usize,
 ) -> Result<Report> {
     let mut report = Report::default();
     let archive = patcher
@@ -349,11 +360,11 @@ fn apply_with(
         b.retail_worst_member_bytes,
         boss::MEMBER_ALLOC
     ));
-    if b.worst_member_bytes > boss::MEMBER_ALLOC {
+    if b.worst_member_bytes > member_limit {
         bail!(
             "the rebuilt player file needs {:#x} bytes of member buffer, the loader allocates {:#x}",
             b.worst_member_bytes,
-            boss::MEMBER_ALLOC
+            member_limit
         );
     }
     if b.file.len() <= entry_len {
@@ -372,6 +383,13 @@ fn apply_with(
             entry_len,
             place.lba,
             place.sectors
+        ));
+    }
+    if b.worst_member_bytes > boss::MEMBER_ALLOC {
+        let size = module_cast::grow_member_alloc(patcher, b.worst_member_bytes)?;
+        report.notes.push(format!(
+            "party-mesh work buffer raised from {:#x} to {size:#x} bytes",
+            boss::MEMBER_ALLOC
         ));
     }
 

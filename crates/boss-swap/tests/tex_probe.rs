@@ -201,3 +201,48 @@ fn gap_bytes() {
         );
     }
 }
+
+#[test]
+#[ignore]
+fn scus_words() {
+    let Some(path) = std::env::var_os("LEGAIA_DISC_BIN") else {
+        return;
+    };
+    let lo = u32::from_str_radix(&std::env::var("PROBE_LO").unwrap(), 16).unwrap();
+    let hi = u32::from_str_radix(&std::env::var("PROBE_HI").unwrap(), 16).unwrap();
+    let p = DiscPatcher::open(std::fs::read(path).unwrap()).unwrap();
+    let scus = p.read_named_file("SCUS_942.54").unwrap();
+    let o = legaia_game_tables::item_names::file_offset_for_va(&scus, lo).unwrap();
+    for i in 0..((hi - lo) / 4) as usize {
+        let w = u32::from_le_bytes(scus[o + i * 4..o + i * 4 + 4].try_into().unwrap());
+        println!("{:08x}: {w:08x}", lo + i as u32 * 4);
+    }
+}
+
+#[test]
+#[ignore]
+fn record_spells() {
+    let Some(path) = std::env::var_os("LEGAIA_DISC_BIN") else {
+        return;
+    };
+    let p = DiscPatcher::open(std::fs::read(path).unwrap()).unwrap();
+    let scus = p.read_named_file("SCUS_942.54").unwrap();
+    let archive = p.read_entry_footprint(867).unwrap();
+    let table = legaia_game_tables::spell_names::SpellNameTable::from_scus(&scus).unwrap();
+    for id in std::env::var("PROBE_IDS").unwrap().split(',') {
+        let id: u16 = id.parse().unwrap();
+        let block = monster_archive::decode_block(&archive, id)
+            .unwrap()
+            .unwrap();
+        let spells = &block[0x21..0x24];
+        let off = legaia_game_tables::item_names::file_offset_for_va(&scus, 0x8007_54C8).unwrap();
+        let described: Vec<String> = spells
+            .iter()
+            .map(|&s| {
+                let class = scus[off + s as usize * 12] as char;
+                format!("{s:#x}({class}) {:?}", table.name(s))
+            })
+            .collect();
+        println!("monster {id}: {described:?}");
+    }
+}
