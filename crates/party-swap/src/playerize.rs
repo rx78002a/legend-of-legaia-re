@@ -713,6 +713,7 @@ fn playerize_scaled(
         fusions.weapon_section,
         texture_downscale,
         char_slot,
+        &[],
         &mut warnings,
     )?;
 

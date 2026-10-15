@@ -1323,6 +1323,7 @@ fn aliased_canonical_objects(player_file: &[u8], rig: &PlayerRig) -> Result<Vec<
 /// downscale only, not on how the clips are decimated, and it is the costly
 /// part of a build that retries its decimation ladder: the layout is kept
 /// across those retries.
+#[allow(clippy::too_many_arguments)]
 pub fn boss_geometry(
     player_file: &[u8],
     rig: &PlayerRig,
@@ -1331,10 +1332,11 @@ pub fn boss_geometry(
     char_slot: usize,
     downscale: u32,
     scale: f32,
+    protect: &[usize],
 ) -> Result<BossGeometry> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<HashMap<[u64; 6], BossGeometry>>> = OnceLock::new();
+    static CACHE: OnceLock<Mutex<HashMap<[u64; 7], BossGeometry>>> = OnceLock::new();
     let fold = |b: &[u8]| {
         b.chunks(8).fold(b.len() as u64, |h, c| {
             let mut w = [0u8; 8];
@@ -1349,16 +1351,27 @@ pub fn boss_geometry(
         char_slot as u64,
         u64::from(downscale),
         u64::from(scale.to_bits()),
+        protect.iter().fold(0u64, |h, &p| h * 31 + p as u64 + 1),
     ];
     let cache = CACHE.get_or_init(Default::default);
     if let Some(g) = cache.lock().unwrap().get(&key) {
         return Ok(g.clone());
     }
-    let g = boss_geometry_uncached(player_file, rig, archive, id, char_slot, downscale, scale)?;
+    let g = boss_geometry_uncached(
+        player_file,
+        rig,
+        archive,
+        id,
+        char_slot,
+        downscale,
+        scale,
+        protect,
+    )?;
     cache.lock().unwrap().insert(key, g.clone());
     Ok(g)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn boss_geometry_uncached(
     player_file: &[u8],
     rig: &PlayerRig,
@@ -1367,6 +1380,7 @@ fn boss_geometry_uncached(
     char_slot: usize,
     downscale: u32,
     scale: f32,
+    protect: &[usize],
 ) -> Result<BossGeometry> {
     let mut warnings = Vec::new();
     let mesh = monster_archive::mesh(archive, id)?
@@ -1435,6 +1449,7 @@ fn boss_geometry_uncached(
         None,
         downscale,
         char_slot,
+        protect,
         &mut warnings,
     )?;
     let mut channel_geom = BTreeMap::new();
@@ -1537,10 +1552,20 @@ pub fn bossize_player_file(
     clips: &[BossClip],
     downscale: u32,
     scale: f32,
+    protect: &[usize],
 ) -> Result<Bossized> {
     let pack = battle_data_pack::parse(player_file).context("parse player battle file")?;
     let rec0 = Record0::parse(player_file)?;
-    let geom = boss_geometry(player_file, rig, archive, id, char_slot, downscale, scale)?;
+    let geom = boss_geometry(
+        player_file,
+        rig,
+        archive,
+        id,
+        char_slot,
+        downscale,
+        scale,
+        protect,
+    )?;
     let warnings = geom.warnings.clone();
 
     let mut new_records: Vec<(u32, Vec<u8>)> = Vec::new();

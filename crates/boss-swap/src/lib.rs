@@ -39,6 +39,10 @@ pub struct Options {
     /// starts (a chain's pause between strikes); `0` picks
     /// [`default_attack_pause`].
     pub attack_pause: u32,
+    /// Parts (indices on the player rig, after the part fit) whose texture
+    /// keeps its resolution while any other part can give some up; empty picks
+    /// [`default_protect`].
+    pub protect_parts: Vec<usize>,
     /// The host's reach offset (`DAT_80078878[0]`, Vahn's): a battle walk stops
     /// when `reach + distance` falls below the target's size threshold, so a
     /// more negative value stops the attacker farther away. `None` picks
@@ -85,6 +89,7 @@ impl Default for Options {
             scale: 0.0,
             rate_div: 0,
             attack_pause: 0,
+            protect_parts: Vec::new(),
             reach: None,
             fireball_art: None,
             fireball_swing: true,
@@ -153,6 +158,15 @@ pub fn default_rate_div(monster: u16) -> u32 {
     match monster {
         181 => 2,
         _ => 1,
+    }
+}
+
+/// Parts whose texture is held at full resolution. Cort Juggernaut's part 0 is
+/// the central head and neck, which the finale's cameras come close to.
+pub fn default_protect(monster: u16) -> Vec<usize> {
+    match monster {
+        181 => vec![0],
+        _ => Vec::new(),
     }
 }
 
@@ -413,6 +427,11 @@ fn apply_with(
         .stream_shape(0)
         .map(|s| s.0)
         .context("no idle in record[0]")?;
+    let protect = if opts.protect_parts.is_empty() {
+        default_protect(opts.monster)
+    } else {
+        opts.protect_parts.clone()
+    };
     let mut done = None;
     let mut last_err = None;
     for downscale in [1u32, 2, 4] {
@@ -426,6 +445,7 @@ fn apply_with(
             &clips,
             downscale,
             opts.scale,
+            &protect,
         ) {
             Ok(b) => {
                 if downscale > 1 {
@@ -579,7 +599,7 @@ fn borrowed_spells(monster: u16) -> &'static [u8] {
             module_cast::SPELL_EVIL_SERU,
         ],
         179 => &[module_cast::SPELL_GENOCIDAL_CANNON],
-        181 => &[module_cast::SPELL_FINAL_CRISIS],
+        181 => &[module_cast::SPELL_FINAL_CRISIS, module_cast::SPELL_DOOMSDAY],
         _ => &[],
     }
 }

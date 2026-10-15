@@ -97,6 +97,8 @@ pub const SPELL_GENOCIDAL_CANNON: u8 = 0xB3;
 /// Cort Juggernaut's Final Crisis (PROT 961, tick body `0x801F69D8`; the same
 /// body serves Dead End Crisis `0xA1`).
 pub const SPELL_FINAL_CRISIS: u8 = 0xB4;
+/// Cort Juggernaut's Doomsday (PROT 965, tick body `0x801F69D8`).
+pub const SPELL_DOOMSDAY: u8 = 0xB6;
 
 /// Specials whose effects draw from the texture bank of the boss's own readef
 /// group (Cort's rune circle, the Juggernaut and the shield; Songi's flame):
@@ -110,6 +112,7 @@ pub fn needs_group(spell: u8) -> bool {
             | SPELL_CHAOS_FLARE
             | SPELL_GENOCIDAL_CANNON
             | SPELL_FINAL_CRISIS
+            | SPELL_DOOMSDAY
     )
 }
 
@@ -120,7 +123,9 @@ pub fn default_constant(spell: u8) -> Option<u8> {
         SPELL_HYPER_CRUSH | SPELL_GUILTY_CROSS | SPELL_CHAOS_FLARE | SPELL_FINAL_CRISIS => {
             Some(0x27)
         }
-        SPELL_HYPER_LIGHTNING | SPELL_MYSTIC_CIRCLE | SPELL_GENOCIDAL_CANNON => Some(0x29),
+        SPELL_HYPER_LIGHTNING | SPELL_MYSTIC_CIRCLE | SPELL_GENOCIDAL_CANNON | SPELL_DOOMSDAY => {
+            Some(0x29)
+        }
         SPELL_MYSTIC_SHIELD => Some(0x26),
         SPELL_EVIL_SERU => Some(0x28),
         _ => None,
@@ -170,6 +175,9 @@ pub fn stage_entries(spell: u8) -> Option<StageEntries> {
         SPELL_EVIL_SERU => (None, Some(0x06)),
         // Final Crisis stages raw row 6 once (the Juggernaut's first cast clip)
         SPELL_FINAL_CRISIS => (None, Some(0x06)),
+        // Doomsday stages raw row 7 once (the Juggernaut's second cast clip),
+        // which becomes the pooled row like Mystic Circle's
+        SPELL_DOOMSDAY => (None, Some(0x07)),
         _ => return None,
     };
     Some(StageEntries { row_a, pooled })
@@ -219,6 +227,10 @@ pub struct Layout {
     /// Final Crisis's voice guard (shares the run with Chaos Flare's, which a
     /// Juggernaut build never installs).
     pub guard_961: u32,
+    /// Doomsday's voice guard (the same run as Genocidal Cannon's, and longer:
+    /// it also overlaps Songi's stage-entry loader, which a Juggernaut build
+    /// never installs).
+    pub guard_965: u32,
     /// Evil Seru Magic's stand-in record[0] table (see [`assemble_esm_dummy`]).
     pub esm_dummy: u32,
 }
@@ -241,6 +253,7 @@ pub fn layout() -> Layout {
         guard_951: HOOK_VA + 0x80,
         guard_963: HOOK_VA + 0xB4,
         guard_961: HOOK_VA + 0x80,
+        guard_965: HOOK_VA + 0xB4,
         cf_entry: HOOK_VA + 0xE8,
         caster_cell: HOOK_VA + 0x118,
         esm_dummy: HOOK_VA + 0x208,
@@ -647,6 +660,10 @@ const FC_EPILOGUE_VA: u32 = 0x801F_7870;
 /// Cort's, `0xB5`); every formation-dependent read of the module is forced to
 /// that branch (see [`edits_961`]).
 const FC_CUE_ID: u16 = 0x1C1;
+const DD_CUE_SITE_VA: u32 = 0x801F_6B0C;
+const DD_CUE_RESUME_VA: u32 = 0x801F_6B14;
+const DD_EPILOGUE_VA: u32 = 0x801F_7AE8;
+const DD_CUE_ID: u16 = 0x1C2;
 
 /// A cast whose texture group was requested from the route stub starts while
 /// the stream is still reading the CD, and the opening voice cue (CD-XA on the
@@ -655,8 +672,17 @@ const FC_CUE_ID: u16 = 0x1C1;
 /// streaming applier (`ctx[+0x276]`) is idle. Entered by a `j` that replaces
 /// the cue's `jal` (the delay slot is the original `addiu a0,zero,cue`).
 pub fn assemble_cue_guard(cue: u16, resume: u32, exit: u32) -> Vec<u8> {
+    assemble_cue_guard_with(cue, resume, exit, &[])
+}
+
+/// [`assemble_cue_guard`] behind `prelude` (instructions that run every tick
+/// of the phase, before the wait).
+fn assemble_cue_guard_with(cue: u16, resume: u32, exit: u32, prelude: &[u32]) -> Vec<u8> {
     let mut a = Asm::new();
     let wait = a.label();
+    for &w in prelude {
+        a.op(w);
+    }
     a.op(m::lui(T0, 0x8008));
     a.op(m::lw(T0, T0, 0xBD24)); // ctx
     a.op(m::nop());
@@ -684,6 +710,24 @@ pub fn assemble_cf_guard() -> Vec<u8> {
 
 pub fn assemble_fc_guard() -> Vec<u8> {
     assemble_cue_guard(FC_CUE_ID, FC_CUE_RESUME_VA, FC_EPILOGUE_VA)
+}
+
+/// Doomsday's strike loop counts absolute seats but indexes its arena
+/// arrangement by `3 * count + i`; with the first victim seat at 3 that index
+/// is `3 * (count - 1) + seat`, so phase 0 leaves `count - 1` in the scratch
+/// byte `+0x46` (the guard runs every tick of phase 0, long before the loop).
+pub fn assemble_dd_guard() -> Vec<u8> {
+    assemble_cue_guard_with(
+        DD_CUE_ID,
+        DD_CUE_RESUME_VA,
+        DD_EPILOGUE_VA,
+        &[
+            m::lbu(T0, GP, gp_off(3)),
+            m::nop(),
+            m::addiu(T0, T0, 0xFFFF),
+            m::sb(T0, GP, gp_off(0x46)),
+        ],
+    )
 }
 
 pub fn assemble_gc_guard() -> Vec<u8> {
@@ -1212,6 +1256,67 @@ pub fn edits_961() -> Vec<ModuleEdit> {
     v
 }
 
+const DD_SITES: &[(u32, u32, Site)] = &[
+    // phase 3: the hide loop over the victim row
+    (0x801F6DD0, 0x90420000, Site::LbuCount(V0)),
+    (0x801F6DE8, 0x3C02801D, Site::LwBase(V1)),
+    (0x801F6DEC, 0x24439370, Site::Nop),
+    (0x801F6E10, 0x90420000, Site::LbuCount(V0)),
+    // phase 9: the show loop
+    (0x801F71B0, 0x90620000, Site::LbuCount(V0)),
+    (0x801F71CC, 0x3C02801D, Site::LwBase(V1)),
+    (0x801F71D0, 0x24439370, Site::Nop),
+    (0x801F71F4, 0x90420000, Site::LbuCount(V0)),
+    // phase 8: the second hide loop (its first cell load moves one word up)
+    (0x801F72A0, 0x90420000, Site::LbuCount(V0)),
+    (0x801F72B0, 0x02802021, Site::LwBase(V1)),
+    (0x801F72D8, 0x90420000, Site::LbuCount(V0)),
+    // phase 0xB: seat, strike and show each victim (absolute seats)
+    (0x801F76B8, 0x90420000, Site::LbuCount(V0)),
+    (0x801F76C4, 0x00009021, Site::LbuStart(S2)),
+    (0x801F76D0, 0x02009821, Site::LwBase(S3)),
+    (0x801F7858, 0x90420000, Site::LbuEnd(V0)),
+    // phase 0xC: wait for every victim to settle
+    (0x801F7980, 0x92420000, Site::LbuCount(V0)),
+    (0x801F7990, 0x24070008, Site::LwBase(V1)),
+    // phase 0xFF: put the victim row back
+    (0x801F7A08, 0x92420000, Site::LbuCount(V0)),
+    (0x801F7A24, 0x02002821, Site::LwBase(A1)),
+    (0x801F7A70, 0x90620000, Site::LbuCount(V0)),
+];
+
+/// PROT 965 (Doomsday, `0xB6`) edits. A whole-scene finale: the caster's cast
+/// clip (raw row 7, which becomes the pooled row) opens it, the victim row is
+/// hidden (phases 3 and 8), seated on an arena line (phase 0xB, whose
+/// arrangement table is indexed `3 * count + i`), struck (`FUN_801DD4B0(0x600,
+/// ..)`), shown (phase 9), waited on (phase 0xC) and put back (phase `0xFF`),
+/// all over `actor_table[0 .. ctx[+0]]`. Each loop is pointed at the enemy row
+/// (count from the sweep scratch `+3`, first cell `+8`); the strike loop counts
+/// absolute seats (`+0 .. +1`) because the seat is the damage argument, so its
+/// arrangement index reads the scratch `+0x46` (`count - 1`: with the first
+/// seat at 3, `(count - 1) * 3 + seat` is `3 * count + i`). The module reads
+/// no formation id; the voice cue gets the stream guard.
+pub fn edits_965() -> Vec<ModuleEdit> {
+    let l = layout();
+    let ed = |va, expect, replace| ModuleEdit {
+        va,
+        expect,
+        replace,
+    };
+    let mut v = site_edits(DD_SITES);
+    // the displaced words of the two loads that moved up
+    v.push(ed(0x801F_72B4, 0x0200_1821, 0x0280_2021)); // move v1,s0 -> move a0,s4
+    v.push(ed(0x801F_7998, 0x0200_1821, 0x2407_0008)); // move v1,s0 -> li a3,8
+    v.push(ed(0x801F_773C, 0x90A3_0000, m::lbu(V1, GP, gp_off(0x46))));
+    v.push(ed(
+        0x801F_6B24,
+        m::addiu(V1, ZERO, 7),
+        stage_imm(STAGE_ROW_B),
+    ));
+    v.push(ed(DD_CUE_SITE_VA, m::jal(CUE_FN_VA), m::j(l.guard_965)));
+    v
+}
+
 /// PROT 963 (Genocidal Cannon, `0xB3`) edits. Retail's cannon strikes the
 /// whole party: the victim row is hidden (arm 1), struck (arm 12) and shown
 /// again (arms 11 / 12 / 14 / 17 and the show at arm 8) by loops over
@@ -1302,6 +1407,7 @@ pub fn module_for(spell: u8) -> Option<(usize, Vec<ModuleEdit>)> {
         SPELL_CHAOS_FLARE => Some((951, edits_951())),
         SPELL_GENOCIDAL_CANNON => Some((963, edits_963())),
         SPELL_FINAL_CRISIS => Some((961, edits_961())),
+        SPELL_DOOMSDAY => Some((965, edits_965())),
         _ => None,
     }
 }
@@ -1484,6 +1590,9 @@ pub fn install(
     }
     if readef_base != 0 && specials.iter().any(|s| s.spell == SPELL_FINAL_CRISIS) {
         changed |= write_scus(patcher, l.guard_961, &assemble_fc_guard())?;
+    }
+    if readef_base != 0 && specials.iter().any(|s| s.spell == SPELL_DOOMSDAY) {
+        changed |= write_scus(patcher, l.guard_965, &assemble_dd_guard())?;
     }
     if readef_base != 0 && specials.iter().any(|s| s.spell == SPELL_GENOCIDAL_CANNON) {
         changed |= write_scus(patcher, l.guard_963, &assemble_gc_guard())?;

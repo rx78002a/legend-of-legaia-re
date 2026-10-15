@@ -43,6 +43,11 @@ fn main() -> Result<()> {
                 opts.attack_pause = args.get(i + 1).context("--attack-pause N")?.parse()?;
                 i += 2;
             }
+            "--protect-part" => {
+                opts.protect_parts
+                    .push(args.get(i + 1).context("--protect-part N")?.parse()?);
+                i += 2;
+            }
             "--reach" => {
                 opts.reach = Some(args.get(i + 1).context("--reach N")?.parse()?);
                 i += 2;

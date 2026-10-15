@@ -609,6 +609,7 @@ pub(super) fn relayout_to_band(
     exclude_section: Option<usize>,
     base_scale: u32,
     char_slot: usize,
+    protect: &[usize],
     warnings: &mut Vec<String>,
 ) -> Result<BandLayout> {
     // Collect textured faces (source page is single: the monster page).
@@ -820,15 +821,25 @@ pub(super) fn relayout_to_band(
                 >= 300
         };
         let can = |i: usize| clusters[i].scale < cap || scale_y[i] < cap;
-        let Some(ci) = (0..clusters.len())
-            .filter(|&i| can(i) && big_enough(i))
-            .max_by(|&a, &b| density(a).total_cmp(&density(b)))
-            .or_else(|| {
-                (0..clusters.len())
-                    .filter(|&i| can(i))
-                    .max_by_key(|&i| area(i))
-            })
-        else {
+        // islands of a protected part keep their detail while anything else
+        // can give some up
+        let held = |i: usize| {
+            clusters[i]
+                .faces
+                .iter()
+                .any(|&fi| protect.contains(&faces[fi].obj))
+        };
+        let pick = |allow_held: bool| {
+            (0..clusters.len())
+                .filter(|&i| can(i) && (allow_held || !held(i)) && big_enough(i))
+                .max_by(|&a, &b| density(a).total_cmp(&density(b)))
+                .or_else(|| {
+                    (0..clusters.len())
+                        .filter(|&i| can(i) && (allow_held || !held(i)))
+                        .max_by_key(|&i| area(i))
+                })
+        };
+        let Some(ci) = pick(false).or_else(|| pick(true)) else {
             bail!("texture islands exceed the party band tiles even at quarter resolution");
         };
         let c = &mut clusters[ci];
@@ -839,8 +850,11 @@ pub(super) fn relayout_to_band(
         } else {
             scale_y[ci] *= 2;
         }
+        let mut parts: Vec<usize> = c.faces.iter().map(|&fi| faces[fi].obj).collect();
+        parts.sort_unstable();
+        parts.dedup();
         warnings.push(format!(
-            "player-side texture island {}x{} downscaled to 1/{} x 1/{} to fit the band",
+            "player-side texture island {}x{} (parts {parts:?}) downscaled to 1/{} x 1/{} to fit the band",
             c.bbox.2 - c.bbox.0 + 1,
             c.bbox.3 - c.bbox.1 + 1,
             c.scale,

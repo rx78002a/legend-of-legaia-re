@@ -587,6 +587,34 @@ fn juggernaut_routes_final_crisis() {
     assert_eq!(i16::from_le_bytes([scus[reach], scus[reach + 1]]), 43 - 256);
     let guard = module_cast::assemble_fc_guard();
     assert_eq!(&scus[off(l.guard_961)..][..guard.len()], guard.as_slice());
+    // Doomsday rides Hyper Elbow, its guard is in place and every edit reads
+    // back hazard-free
+    assert_eq!(scus[off(l.table) + 0x29 - 0x10], 0xB6);
+    let m965 = p.read_entry(965).unwrap();
+    let edits = module_cast::edits_965();
+    assert!(edits.len() > 20);
+    for e in &edits {
+        assert_eq!(word(&m965, e.va), e.replace, "965 {:#x}", e.va);
+    }
+    let ws: Vec<u32> = m965
+        .chunks(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for e in &edits {
+        let i = ((e.va - 0x801F_69D8) / 4) as usize;
+        let lo = i.saturating_sub(1);
+        let hi = (i + 3).min(ws.len());
+        for h in legaia_boss_swap::hazard::load_hazards(&ws[lo..hi]) {
+            let at = lo + h;
+            assert!(
+                !(at == i || at + 1 == i),
+                "load-delay hazard at {:#x}",
+                0x801F_69D8 + at as u32 * 4
+            );
+        }
+    }
+    let guard = module_cast::assemble_dd_guard();
+    assert_eq!(&scus[off(l.guard_965)..][..guard.len()], guard.as_slice());
     // the pose is the pooled row: no row-A stage entry for this build
     assert_eq!(
         module_cast::stage_entries(module_cast::SPELL_FINAL_CRISIS)
