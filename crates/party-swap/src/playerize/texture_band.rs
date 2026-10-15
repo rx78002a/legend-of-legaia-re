@@ -394,50 +394,66 @@ pub(super) fn relayout_to_band(
     // largest cluster and retry on overflow.
     let regions = band_regions(char_slot);
     // (region, x, y) per cluster.
-    let placement: Vec<(usize, usize, usize)> = loop {
-        let mut order: Vec<usize> = (0..clusters.len()).collect();
-        order.sort_by_key(|&i| {
-            let c = &clusters[i];
-            let h = ((c.bbox.3 - c.bbox.1) as usize + 1).div_ceil(c.scale as usize);
-            std::cmp::Reverse(h)
-        });
-        let mut cursors: Vec<(usize, usize, usize)> = regions.iter().map(|_| (0, 0, 0)).collect();
-        let mut placed = vec![None; clusters.len()];
-        'clusters: for &i in &order {
-            let c = &clusters[i];
-            let s = c.scale as usize;
-            let w = ((c.bbox.2 - c.bbox.0) as usize + 1).div_ceil(s);
-            let h = ((c.bbox.3 - c.bbox.1) as usize + 1).div_ceil(s);
-            for (ri, r) in regions.iter().enumerate() {
-                if page1[i] && r.page != 1 {
-                    continue;
+    let (placement, gutter): (Vec<(usize, usize, usize)>, usize) = loop {
+        // Try with a one-texel gutter right of and below every island first
+        // (a rasteriser that overshoots a face's last column or row then
+        // reads the island's own edge, not its neighbour's texels), then
+        // without when the band is too tight for it.
+        let attempt = |g: usize| -> Vec<Option<(usize, usize, usize)>> {
+            let mut order: Vec<usize> = (0..clusters.len()).collect();
+            order.sort_by_key(|&i| {
+                let c = &clusters[i];
+                let h = ((c.bbox.3 - c.bbox.1) as usize + 1).div_ceil(c.scale as usize);
+                std::cmp::Reverse(h)
+            });
+            let mut cursors: Vec<(usize, usize, usize)> =
+                regions.iter().map(|_| (0, 0, 0)).collect();
+            let mut placed = vec![None; clusters.len()];
+            'clusters: for &i in &order {
+                let c = &clusters[i];
+                let s = c.scale as usize;
+                let w = ((c.bbox.2 - c.bbox.0) as usize + 1).div_ceil(s) + g;
+                let h = ((c.bbox.3 - c.bbox.1) as usize + 1).div_ceil(s) + g;
+                for (ri, r) in regions.iter().enumerate() {
+                    if page1[i] && r.page != 1 {
+                        continue;
+                    }
+                    // The weapon section's tile belongs to the per-record
+                    // weapon texture (see `weapon_fuse`) - no sibling
+                    // islands there.
+                    if Some(r.section) == exclude_section {
+                        continue;
+                    }
+                    let (ref mut x, ref mut y, ref mut shelf) = cursors[ri];
+                    if w > r.w || h > r.h {
+                        continue;
+                    }
+                    if *x + w > r.w {
+                        *y += *shelf;
+                        *x = 0;
+                        *shelf = 0;
+                    }
+                    if *y + h > r.h {
+                        continue;
+                    }
+                    placed[i] = Some((ri, *x, *y));
+                    *x += w;
+                    *shelf = (*shelf).max(h);
+                    continue 'clusters;
                 }
-                // The weapon section's tile belongs to the per-record
-                // weapon texture (see `weapon_fuse`) - no sibling
-                // islands there.
-                if Some(r.section) == exclude_section {
-                    continue;
-                }
-                let (ref mut x, ref mut y, ref mut shelf) = cursors[ri];
-                if w > r.w || h > r.h {
-                    continue;
-                }
-                if *x + w > r.w {
-                    *y += *shelf;
-                    *x = 0;
-                    *shelf = 0;
-                }
-                if *y + h > r.h {
-                    continue;
-                }
-                placed[i] = Some((ri, *x, *y));
-                *x += w;
-                *shelf = (*shelf).max(h);
-                continue 'clusters;
+            }
+            placed
+        };
+        let mut found = None;
+        for g in [1usize, 0] {
+            let placed = attempt(g);
+            if placed.iter().all(|p| p.is_some()) {
+                found = Some((placed.into_iter().map(|p| p.unwrap()).collect(), g));
+                break;
             }
         }
-        if placed.iter().all(|p| p.is_some()) {
-            break placed.into_iter().map(|p| p.unwrap()).collect();
+        if let Some(f) = found {
+            break f;
         }
         let cap = base_scale * 4;
         let Some(big) = clusters
@@ -595,6 +611,23 @@ pub(super) fn relayout_to_band(
                 tiles[ri][at] = new_idx as u8;
                 painted[ri][at] = true;
                 hard[ri][at] = hard_pick;
+            }
+        }
+    }
+    // The gutter right of and below each island repeats the island's edge.
+    if gutter > 0 {
+        for (ci, c) in clusters.iter().enumerate() {
+            let (ri, dx, dy) = placement[ci];
+            let s = c.scale as usize;
+            let w = ((c.bbox.2 - c.bbox.0) as usize + 1).div_ceil(s);
+            let h = ((c.bbox.3 - c.bbox.1) as usize + 1).div_ceil(s);
+            let rw = regions[ri].w;
+            let tile = &mut tiles[ri];
+            for y in 0..h {
+                tile[(dy + y) * rw + dx + w] = tile[(dy + y) * rw + dx + w - 1];
+            }
+            for x in 0..=w {
+                tile[(dy + h) * rw + dx + x] = tile[(dy + h - 1) * rw + dx + x.min(w - 1)];
             }
         }
     }

@@ -27,7 +27,8 @@ pub const VAHN_ENTRY: usize = 863;
 pub struct Options {
     /// Monster id of the boss (1-based archive id).
     pub monster: u16,
-    /// Uniform scale applied to the boss geometry and pose translations.
+    /// Uniform scale applied to the boss geometry and pose translations;
+    /// `0` picks [`default_scale`].
     pub scale: f32,
     /// The art record (by inline name) that plays the boss's cast - its
     /// fireball - instead of a melee move (stage 1: the art walks up first).
@@ -67,7 +68,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             monster: 76,
-            scale: 0.8,
+            scale: 0.0,
             fireball_art: None,
             fireball_swing: true,
             direct_cast: true,
@@ -107,12 +108,29 @@ const DECIMATE_CAPS: [(Option<usize>, usize, usize); 14] = [
     (Some(12), 3, 3),
 ];
 
+/// The size a boss is built at. The first three builds that were played on
+/// hardware use `0.8`; every other monster keeps its own size (`1.0`), which is
+/// what a cast module's effects are authored for: they are anchored at the
+/// caster's position with fixed offsets, so a smaller model had them floating
+/// above its mouth.
+pub fn default_scale(monster: u16) -> f32 {
+    match monster {
+        76 | 136 | 180 => 0.8,
+        _ => 1.0,
+    }
+}
+
 /// Apply the boss swap to Vahn's slot. Writes through `patcher`.
 ///
 /// A boss with long clips can overflow the player file; the build then
 /// retries with its longest clips decimated. Nothing is written before the
 /// size checks, so a retry starts from the untouched image.
 pub fn apply(patcher: &mut DiscPatcher, opts: &Options) -> Result<Report> {
+    let mut resolved = opts.clone();
+    if resolved.scale <= 0.0 {
+        resolved.scale = default_scale(opts.monster);
+    }
+    let opts = &resolved;
     let mut last = None;
     for (cap, stage, pool) in DECIMATE_CAPS {
         match apply_with(patcher, opts, cap, stage, pool) {
