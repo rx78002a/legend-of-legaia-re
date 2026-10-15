@@ -33,6 +33,20 @@ fn check(p: &DiscPatcher) {
     let snap = direct_cast::assemble_snap();
     let snap_va = direct_cast::snap_va();
     assert_eq!(&scus[off(snap_va)..][..snap.len()], snap.as_slice());
+    // the strike and recovery states frame the caster through the camera stub
+    let camera = direct_cast::assemble_camera();
+    assert_eq!(
+        &scus[off(legaia_boss_swap::module_cast::HOOK_VA)..][..camera.len()],
+        camera.as_slice()
+    );
+    for site in [0x801E_36E8u32, 0x801E_3AC8] {
+        let at = (site - 0x801C_E818) as usize;
+        assert_eq!(
+            u32::from_le_bytes(overlay[at..at + 4].try_into().unwrap()),
+            m::jal(legaia_boss_swap::module_cast::HOOK_VA),
+            "camera call {site:#x}"
+        );
+    }
     let site = off(0x8004_BFA8);
     assert_eq!(
         u32::from_le_bytes(scus[site..site + 4].try_into().unwrap()),

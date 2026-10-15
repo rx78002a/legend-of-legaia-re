@@ -39,10 +39,11 @@
 //! acting actor, `s5` is `ctx + 0x11` and no temporary is live across the
 //! call; at `0x8004BFA8` `s1` is the committing actor and `a0` its seat.
 
+use crate::module_cast::{HOOK_END_VA, HOOK_VA};
 use anyhow::{Context, Result, bail};
 use legaia_code_hooks::arenas::{ARENA1_END_VA, ARENA1_VA, SCUS_GAP_END_VA, SCUS_GAP_VA};
 use legaia_code_hooks::mips::{
-    self as m, A0, RA, S1, S3, SP, T0, T1, T2, T3, T4, T5, T6, V0, ZERO,
+    self as m, A0, A1, RA, S1, S3, SP, T0, T1, T2, T3, T4, T5, T6, V0, ZERO,
 };
 use legaia_disc_patch::disc::DiscPatcher;
 
@@ -55,6 +56,12 @@ const RANGE_CALL_VA: u32 = 0x801E_31F4;
 const RANGE_FN_VA: u32 = 0x8004_E2F0;
 /// The range-normalising block of the anim commit in `SCUS_942.54` and its
 /// exit (the function epilogue).
+/// The battle camera's framing function `FUN_801D5854(seat, case)` and the two
+/// calls the strike (`0x1E`) and recovery (`0x1F`) states make with case 7 / 8
+/// (the two-shot / the target); case 6 frames the acting actor.
+const CAMERA_FN_VA: u32 = 0x801D_5854;
+const CAMERA_SITES: [u32; 2] = [0x801E_36E8, 0x801E_3AC8];
+const CAMERA_ACTING_CASE: u16 = 6;
 const SNAP_SITE_VA: u32 = 0x8004_BFA8;
 const SNAP_EXIT_VA: u32 = 0x8004_C11C;
 const SCUS_NAME: &str = "SCUS_942.54";
@@ -271,6 +278,38 @@ pub fn assemble_snap() -> Vec<u8> {
     a.finish().iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
+/// The camera stub behind the strike and recovery states' framing calls
+/// (`a0` = seat, `a1` = the case): for the collapsed fireball swing (seat 0,
+/// queue exactly `[0x0F, 0]`) it asks for the acting-actor framing, so the
+/// camera stays on the host while it casts instead of travelling to the target
+/// before the projectile leaves; any other call goes through unchanged.
+pub fn assemble_camera() -> Vec<u8> {
+    let mut a = Asm::new();
+    let real = a.label();
+    a.br(real, bne_a0); // only seat 0
+    a.op(m::nop());
+    a.op(m::lui(T0, 0x801D));
+    a.op(m::lw(T0, T0, 0x9370)); // actor_table[0]
+    a.op(m::nop());
+    a.op(m::lbu(T1, T0, 0x1DF)); // first queue byte
+    a.op(m::addiu(T2, ZERO, u16::from(FIREBALL_BYTE)));
+    a.op(m::lbu(T3, T0, 0x1E0)); // must be the terminator
+    a.op(m::nop());
+    a.br(real, bne_t1t2);
+    a.op(m::nop());
+    a.br(real, bne_t3z);
+    a.op(m::nop());
+    a.op(m::addiu(A1, ZERO, CAMERA_ACTING_CASE));
+    a.bind(real);
+    a.op(m::j(CAMERA_FN_VA));
+    a.op(m::nop());
+    a.finish().iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+fn bne_t3z(o: i16) -> u32 {
+    m::bne(T3, ZERO, o)
+}
+
 /// Write the stubs and redirect the two range calls. Returns `false` when
 /// everything is already in place.
 pub fn install(patcher: &mut DiscPatcher, constants: &[u8], plain_up: u8) -> Result<bool> {
@@ -291,6 +330,11 @@ pub fn install(patcher: &mut DiscPatcher, constants: &[u8], plain_up: u8) -> Res
     changed |= write_scus(patcher, snap_va(), &snap)?;
     changed |= write_scus(patcher, table_va(), &tbl)?;
     changed |= redirect_scus_call(patcher, SNAP_SITE_VA, snap_va())?;
+    let camera = assemble_camera();
+    if HOOK_VA + camera.len() as u32 > HOOK_END_VA {
+        bail!("direct-cast camera stub does not fit its gap");
+    }
+    changed |= write_scus(patcher, HOOK_VA, &camera)?;
 
     let entry = patcher.read_entry(BATTLE_OVERLAY_PROT)?;
     let at = (RANGE_CALL_VA - BATTLE_OVERLAY_BASE) as usize;
@@ -304,6 +348,19 @@ pub fn install(patcher: &mut DiscPatcher, constants: &[u8], plain_up: u8) -> Res
         }
         patcher.patch_prot_entry(BATTLE_OVERLAY_PROT, at as u64, &hooked.to_le_bytes())?;
         changed = true;
+    }
+    for site in CAMERA_SITES {
+        let at = (site - BATTLE_OVERLAY_BASE) as usize;
+        let entry = patcher.read_entry(BATTLE_OVERLAY_PROT)?;
+        let word = u32::from_le_bytes(entry[at..at + 4].try_into()?);
+        let (retail, hooked) = (m::jal(CAMERA_FN_VA), m::jal(HOOK_VA));
+        if word != hooked {
+            if word != retail {
+                bail!("camera call at {site:#010x}: expected {retail:#010x}, found {word:#010x}");
+            }
+            patcher.patch_prot_entry(BATTLE_OVERLAY_PROT, at as u64, &hooked.to_le_bytes())?;
+            changed = true;
+        }
     }
     Ok(changed)
 }
@@ -453,6 +510,47 @@ mod tests {
         ] {
             assert_eq!(snap(seat, queue), RANGE_FN_VA, "{seat} {queue:x?}");
         }
+    }
+
+    /// Run the camera stub: the case it hands `FUN_801D5854` for a call made
+    /// with case 7 by `seat` while the host's queue is `queue`.
+    fn camera(seat: u32, queue: &[u8]) -> u32 {
+        let mut cpu = Cpu::new();
+        cpu.load(HOOK_VA, &assemble_camera());
+        cpu.wr32(0x801C_9370, ACTOR);
+        cpu.load(ACTOR + 0x1DF, queue);
+        cpu.r[A0 as usize] = seat;
+        cpu.r[A1 as usize] = 7;
+        cpu.r[RA as usize] = 0x801E_36F0;
+        cpu.pc = HOOK_VA;
+        assert_eq!(cpu.run_until(&[CAMERA_FN_VA]), CAMERA_FN_VA);
+        assert_eq!(cpu.r[A0 as usize], seat, "seat untouched");
+        cpu.r[A1 as usize]
+    }
+
+    #[test]
+    fn camera_frames_the_caster_only_for_the_collapsed_fireball() {
+        assert_eq!(camera(0, &[0x0F, 0]), u32::from(CAMERA_ACTING_CASE));
+        for (seat, queue) in [
+            (1, &[0x0F, 0][..]),
+            (0, &[0x0E, 0][..]),
+            (0, &[0x0A, 0][..]),
+            (0, &[0x0F, 0x0E][..]),
+            (0, &[0x0F, 0x19, 0x27, 0][..]),
+        ] {
+            assert_eq!(camera(seat, queue), 7, "{seat} {queue:x?}");
+        }
+    }
+
+    #[test]
+    fn camera_stub_has_no_load_hazard_and_fits() {
+        let b = assemble_camera();
+        let w: Vec<u32> = b
+            .chunks(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert!(crate::hazard::load_hazards(&w).is_empty());
+        assert!(HOOK_VA as usize + b.len() <= HOOK_END_VA as usize);
     }
 
     #[test]
