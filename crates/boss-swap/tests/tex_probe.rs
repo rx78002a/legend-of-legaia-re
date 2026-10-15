@@ -147,3 +147,33 @@ fn part_counts() {
         println!("{n:3} parts: {} monsters {:?}", ids.len(), ids);
     }
 }
+
+#[test]
+#[ignore]
+fn flat_prims() {
+    let Some(path) = std::env::var_os("LEGAIA_DISC_BIN") else {
+        return;
+    };
+    let id: u16 = std::env::var("PROBE_ID").unwrap().parse().unwrap();
+    let p = DiscPatcher::open(std::fs::read(path).unwrap()).unwrap();
+    let archive = p.read_entry_footprint(867).unwrap();
+    let mesh = monster_archive::mesh(&archive, id).unwrap().unwrap();
+    let bytes = mesh.tmd_bytes();
+    let tmd = legaia_tmd::parse(bytes).unwrap();
+    for (oi, o) in tmd.objects.iter().enumerate() {
+        for g in legaia_prims::iter_groups_lenient(
+            bytes,
+            o.primitives_byte_offset,
+            o.primitives_byte_size,
+        ) {
+            for (pi, p) in g.prims.iter().enumerate() {
+                if p.uvs.is_empty() {
+                    println!(
+                        "FLAT obj {oi} flags {:#06x} prim {pi} colors {:?}",
+                        g.header.flags, p.colors
+                    );
+                }
+            }
+        }
+    }
+}

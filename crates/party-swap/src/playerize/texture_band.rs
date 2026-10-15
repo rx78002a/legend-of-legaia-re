@@ -233,6 +233,31 @@ fn color_distance(a: u16, b: u16) -> usize {
     ((ar - br).pow(2) + (ag - bg).pow(2) + (ab - bb).pow(2)) as usize
 }
 
+/// Whether the texel `(x, y)` lies on the polygon a prim's UVs outline (quads
+/// are two triangles in the file's Z order), with three quarters of a texel of
+/// slack so the texels the rasteriser touches along an edge count.
+fn covers(uvs: &[(u8, u8)], x: usize, y: usize) -> bool {
+    let p = (x as f32 + 0.5, y as f32 + 0.5);
+    let q = |i: usize| (f32::from(uvs[i].0), f32::from(uvs[i].1));
+    let inside = |a: (f32, f32), b: (f32, f32), c: (f32, f32)| {
+        let edge = |u: (f32, f32), v: (f32, f32)| {
+            let (ex, ey) = (v.0 - u.0, v.1 - u.1);
+            let len = (ex * ex + ey * ey).sqrt().max(1e-3);
+            (ex * (p.1 - u.1) - ey * (p.0 - u.0)) / len
+        };
+        let area = (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0);
+        let sign = if area < 0.0 { -1.0 } else { 1.0 };
+        [edge(a, b), edge(b, c), edge(c, a)]
+            .iter()
+            .all(|d| d * sign >= -0.75)
+    };
+    match uvs.len() {
+        3 => inside(q(0), q(1), q(2)),
+        4 => inside(q(0), q(1), q(2)) || inside(q(1), q(3), q(2)),
+        _ => true,
+    }
+}
+
 /// Nearest colour in `colors` to `c` (RGB555 distance).
 pub(in super::super) fn nearest_color(colors: &[u16], c: u16) -> usize {
     let split = |v: u16| {
@@ -463,6 +488,9 @@ pub(super) fn relayout_to_band(
     // (bounded seam residual - same limitation the OBJ importer has).
     let mut tiles: Vec<Vec<u8>> = regions.iter().map(|r| vec![0u8; r.w * r.h]).collect();
     let mut painted: Vec<Vec<bool>> = regions.iter().map(|r| vec![false; r.w * r.h]).collect();
+    // painted from a texel the face's polygon covers (a later covered texel
+    // may replace one that was only a stand-in)
+    let mut hard: Vec<Vec<bool>> = regions.iter().map(|r| vec![false; r.w * r.h]).collect();
     let src_texel = |page: usize, x: usize, y: usize| -> u8 {
         let (ind, w) = match (page, companion) {
             (1, Some(c)) => c,
@@ -482,33 +510,91 @@ pub(super) fn relayout_to_band(
             let src_pal = (p.cba & 0x3F) as usize;
             let group = group_of[&(src_pal as u8)];
             let colors = &group_colors[group];
-            // Paint the face's bbox region (conservative cover).
             let fb = f.bbox;
-            for sy in (fb.1 as usize..=fb.3 as usize).step_by(s) {
-                for sx in (fb.0 as usize..=fb.2 as usize).step_by(s) {
-                    let tx = dx + (sx - c.bbox.0 as usize) / s;
-                    let ty = dy + (sy - c.bbox.1 as usize) / s;
-                    let r = &regions[ri];
-                    if tx >= r.w || ty >= r.h {
-                        continue;
-                    }
-                    let at = ty * r.w + tx;
-                    if painted[ri][at] {
-                        continue;
-                    }
-                    let idx = src_texel(f.page, sx, sy) as usize;
-                    let color = cluts[src_pal][idx];
-                    let new_idx = if (idx == 0 && !idx0_opaque) || color == 0 {
-                        0
-                    } else {
-                        match colors.iter().position(|&cc| cc == color) {
-                            Some(pos) => pos + 1,
-                            None => nearest_color(colors, color) + 1,
+            let (bx, by) = (c.bbox.0 as usize, c.bbox.1 as usize);
+            let r = &regions[ri];
+            // The band texels the face can sample: the rewritten UVs are
+            // `(uv - bbox0) / s`, so it reaches `(fb0 - bbox0) / s ..=
+            // (fb2 - bbox0) / s`. At full resolution each takes the source
+            // texel under it (first writer wins). A downscaled island picks
+            // per band texel a source texel the face's polygon really
+            // covers: the box around a triangle holds the artists' padding
+            // (bright checkers), and a block-centre sample that landed in it
+            // showed up as stray coloured dots along the face's edges.
+            let tx_range = (fb.0 as usize - bx) / s..=(fb.2 as usize - bx) / s;
+            let ty_range = (fb.1 as usize - by) / s..=(fb.3 as usize - by) / s;
+            let mut picks: Vec<(usize, usize, usize, usize, bool)> = Vec::new();
+            for ty0 in ty_range.clone() {
+                for tx0 in tx_range.clone() {
+                    let (cx, cy) = (bx + tx0 * s + s / 2, by + ty0 * s + s / 2);
+                    // the covered source texel of this block nearest its centre
+                    let (x0, x1) = (
+                        (bx + tx0 * s).max(fb.0 as usize),
+                        (bx + (tx0 + 1) * s - 1).min(fb.2 as usize),
+                    );
+                    let (y0, y1) = (
+                        (by + ty0 * s).max(fb.1 as usize),
+                        (by + (ty0 + 1) * s - 1).min(fb.3 as usize),
+                    );
+                    let mut covered: Option<(usize, usize, usize)> = None;
+                    for y in y0..=y1 {
+                        for x in x0..=x1 {
+                            if !covers(&p.uvs, x, y) {
+                                continue;
+                            }
+                            let d = x.abs_diff(cx) + y.abs_diff(cy);
+                            if covered.is_none_or(|(bd, _, _)| d < bd) {
+                                covered = Some((d, x, y));
+                            }
                         }
-                    };
-                    tiles[ri][at] = new_idx as u8;
-                    painted[ri][at] = true;
+                    }
+                    match covered {
+                        Some((_, x, y)) => picks.push((tx0, ty0, x, y, true)),
+                        None => {
+                            let x = cx.clamp(fb.0 as usize, fb.2 as usize);
+                            let y = cy.clamp(fb.1 as usize, fb.3 as usize);
+                            picks.push((tx0, ty0, x, y, false));
+                        }
+                    }
                 }
+            }
+            // texels past the polygon's edge copy the nearest covered one
+            let covered_picks: Vec<(usize, usize, usize, usize)> = picks
+                .iter()
+                .filter(|p| p.4)
+                .map(|p| (p.0, p.1, p.2, p.3))
+                .collect();
+            for pick in picks.iter_mut().filter(|p| !p.4) {
+                let near = covered_picks
+                    .iter()
+                    .min_by_key(|h| h.0.abs_diff(pick.0).max(h.1.abs_diff(pick.1)));
+                if let Some(&(_, _, x, y)) = near {
+                    pick.2 = x;
+                    pick.3 = y;
+                }
+            }
+            for (tx0, ty0, sx, sy, hard_pick) in picks {
+                let (tx, ty) = (dx + tx0, dy + ty0);
+                if tx >= r.w || ty >= r.h {
+                    continue;
+                }
+                let at = ty * r.w + tx;
+                if painted[ri][at] && !(hard_pick && !hard[ri][at]) {
+                    continue;
+                }
+                let idx = src_texel(f.page, sx, sy) as usize;
+                let color = cluts[src_pal][idx];
+                let new_idx = if (idx == 0 && !idx0_opaque) || color == 0 {
+                    0
+                } else {
+                    match colors.iter().position(|&cc| cc == color) {
+                        Some(pos) => pos + 1,
+                        None => nearest_color(colors, color) + 1,
+                    }
+                };
+                tiles[ri][at] = new_idx as u8;
+                painted[ri][at] = true;
+                hard[ri][at] = hard_pick;
             }
         }
     }
