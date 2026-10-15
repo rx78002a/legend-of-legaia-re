@@ -290,6 +290,109 @@ fn face_palette(objects: &[ModelObject], f: &FaceRef) -> u16 {
     objects[f.obj].groups[f.group].prims[f.prim].cba & 0x3F
 }
 
+/// An island's footprint in the band at horizontal / vertical divisors
+/// `sx` / `sy`.
+fn island_dims(bbox: (u8, u8, u8, u8), sx: u32, sy: u32) -> (usize, usize) {
+    (
+        ((bbox.2 - bbox.0) as usize + 1).div_ceil(sx as usize),
+        ((bbox.3 - bbox.1) as usize + 1).div_ceil(sy as usize),
+    )
+}
+
+/// The band texels an island occupies: those its faces' polygons cover,
+/// widened by `ring` texels all round (what a rasteriser that overshoots a
+/// polygon's edge may read), in a `(w + 2 * ring) x (h + 2 * ring)` frame whose
+/// content starts at `(ring, ring)`.
+struct IslandMask {
+    w: usize,
+    h: usize,
+    cells: Vec<bool>,
+}
+
+fn island_mask(
+    cluster: &Cluster,
+    sy: u32,
+    ring: usize,
+    covered: &[Vec<(usize, usize)>],
+) -> IslandMask {
+    let (w, h) = island_dims(cluster.bbox, cluster.scale, sy);
+    let (mw, mh) = (w + 2 * ring, h + 2 * ring);
+    let mut core = vec![false; mw * mh];
+    let (bx, by) = (cluster.bbox.0 as usize, cluster.bbox.1 as usize);
+    for &fi in &cluster.faces {
+        for &(x, y) in &covered[fi] {
+            let tx = (x - bx) / cluster.scale as usize + ring;
+            let ty = (y - by) / sy as usize + ring;
+            core[ty * mw + tx] = true;
+        }
+    }
+    let mut cells = core.clone();
+    for y in 0..mh {
+        for x in 0..mw {
+            if !core[y * mw + x] {
+                continue;
+            }
+            for yy in y.saturating_sub(ring)..=(y + ring).min(mh - 1) {
+                for xx in x.saturating_sub(ring)..=(x + ring).min(mw - 1) {
+                    cells[yy * mw + xx] = true;
+                }
+            }
+        }
+    }
+    IslandMask {
+        w: mw,
+        h: mh,
+        cells,
+    }
+}
+
+/// Pack island masks into the band `regions`, first fit with the largest
+/// first; a mask only has to avoid the *texels* the others occupy, so a small
+/// island settles in the gaps of a large one. `allowed(island, region)` gates
+/// where an island may go. Returns `(region, x, y)` of each mask's frame, `None`
+/// for one that found no room.
+fn pack_masks(
+    regions: &[BandRegion],
+    masks: &[IslandMask],
+    allowed: impl Fn(usize, usize) -> bool,
+) -> Vec<Option<(usize, usize, usize)>> {
+    let mut taken: Vec<Vec<bool>> = regions.iter().map(|r| vec![false; r.w * r.h]).collect();
+    let mut order: Vec<usize> = (0..masks.len()).collect();
+    order.sort_by_key(|&i| {
+        let m = &masks[i];
+        let n = m.cells.iter().filter(|&&c| c).count();
+        (std::cmp::Reverse(m.w.max(m.h)), std::cmp::Reverse(n), i)
+    });
+    let mut placed = vec![None; masks.len()];
+    for i in order {
+        let m = &masks[i];
+        let pts: Vec<(usize, usize)> = (0..m.h)
+            .flat_map(|y| (0..m.w).map(move |x| (x, y)))
+            .filter(|&(x, y)| m.cells[y * m.w + x])
+            .collect();
+        'regions: for (ri, r) in regions.iter().enumerate() {
+            if !allowed(i, ri) || m.w > r.w || m.h > r.h {
+                continue;
+            }
+            for y in 0..=(r.h - m.h) {
+                'spot: for x in 0..=(r.w - m.w) {
+                    for &(px, py) in &pts {
+                        if taken[ri][(y + py) * r.w + x + px] {
+                            continue 'spot;
+                        }
+                    }
+                    for &(px, py) in &pts {
+                        taken[ri][(y + py) * r.w + x + px] = true;
+                    }
+                    placed[i] = Some((ri, x, y));
+                    break 'regions;
+                }
+            }
+        }
+    }
+    placed
+}
+
 /// The re-laid band texture: per-section pool blocks + per-face rewrites.
 pub(super) struct BandLayout {
     /// Per-section `[u16 clut_x][u16 clut_n][cluts][pixels]` pool bytes.
@@ -333,7 +436,33 @@ pub(super) fn relayout_to_band(
         }
     }
 
-    // Cluster by inflated-bbox overlap (same idiom as the enemy side).
+    // Cluster faces whose polygons touch: a texel one covers lies within
+    // `TOUCH` texels of one the other covers. Boxes would join charts that only
+    // overlap in the artists' padding and leave half of every island empty.
+    // Faces on different source palettes never share an island: the same
+    // texels recoloured through two CLUTs (palette swaps) would otherwise
+    // collide on one band tile and the second palette's faces would sample
+    // the first's index values.
+    const TOUCH: i32 = 2;
+    // the source texels each face's polygon covers (its corner when none)
+    let covered: Vec<Vec<(usize, usize)>> = faces
+        .iter()
+        .map(|f| {
+            let uvs = &objects[f.obj].groups[f.group].prims[f.prim].uvs;
+            let mut texels = Vec::new();
+            for y in f.bbox.1..=f.bbox.3 {
+                for x in f.bbox.0..=f.bbox.2 {
+                    if covers(uvs, x as usize, y as usize) {
+                        texels.push((x as usize, y as usize));
+                    }
+                }
+            }
+            if texels.is_empty() {
+                texels.push((f.bbox.0 as usize, f.bbox.1 as usize));
+            }
+            texels
+        })
+        .collect();
     let mut parent: Vec<usize> = (0..faces.len()).collect();
     fn find(parent: &mut Vec<usize>, i: usize) -> usize {
         if parent[i] != i {
@@ -342,20 +471,25 @@ pub(super) fn relayout_to_band(
         }
         parent[i]
     }
+    let mut seen: std::collections::HashMap<(u16, i32, i32), usize> =
+        std::collections::HashMap::new();
     for i in 0..faces.len() {
-        for j in (i + 1)..faces.len() {
-            // Faces on different source palettes never share an island:
-            // the same texels recoloured through two CLUTs (palette swaps)
-            // would otherwise collide on one band tile and the second
-            // palette's faces would sample the first's index values.
-            if face_palette(objects, &faces[i]) == face_palette(objects, &faces[j])
-                && boxes_touch(faces[i].bbox, faces[j].bbox)
-            {
-                let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
-                if ri != rj {
-                    parent[ri] = rj;
+        let pal = face_palette(objects, &faces[i]);
+        for &(x, y) in &covered[i] {
+            let (x, y) = (x as i32, y as i32);
+            for dy in -TOUCH..=TOUCH {
+                for dx in -TOUCH..=TOUCH {
+                    if let Some(&j) = seen.get(&(pal, x + dx, y + dy)) {
+                        let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+                        if ri != rj {
+                            parent[ri] = rj;
+                        }
+                    }
                 }
             }
+        }
+        for &(x, y) in &covered[i] {
+            seen.entry((pal, x as i32, y as i32)).or_insert(i);
         }
     }
     let mut clusters: BTreeMap<usize, Cluster> = BTreeMap::new();
@@ -388,67 +522,38 @@ pub(super) fn relayout_to_band(
         })
         .collect();
 
-    // Multi-region shelf pack: place each cluster into one band region
-    // (a face samples a single texpage, so a cluster cannot straddle a
-    // region boundary). First-fit-decreasing per region; halve the
-    // largest cluster and retry on overflow.
+    // Multi-region pack: place each cluster into one band region (a face
+    // samples a single texpage, so a cluster cannot straddle a region
+    // boundary). Islands are packed by the texels their polygons cover (see
+    // [`pack_masks`]). On overflow the largest island is halved along its
+    // longer axis and the pack retried.
     let regions = band_regions(char_slot);
-    // (region, x, y) per cluster.
-    let (placement, gutter): (Vec<(usize, usize, usize)>, usize) = loop {
-        // Try with a one-texel gutter right of and below every island first
-        // (a rasteriser that overshoots a face's last column or row then
-        // reads the island's own edge, not its neighbour's texels), then
-        // without when the band is too tight for it.
-        let attempt = |g: usize| -> Vec<Option<(usize, usize, usize)>> {
-            let mut order: Vec<usize> = (0..clusters.len()).collect();
-            order.sort_by_key(|&i| {
-                let c = &clusters[i];
-                let h = ((c.bbox.3 - c.bbox.1) as usize + 1).div_ceil(c.scale as usize);
-                std::cmp::Reverse(h)
-            });
-            let mut cursors: Vec<(usize, usize, usize)> =
-                regions.iter().map(|_| (0, 0, 0)).collect();
-            let mut placed = vec![None; clusters.len()];
-            'clusters: for &i in &order {
-                let c = &clusters[i];
-                let s = c.scale as usize;
-                let w = ((c.bbox.2 - c.bbox.0) as usize + 1).div_ceil(s) + g;
-                let h = ((c.bbox.3 - c.bbox.1) as usize + 1).div_ceil(s) + g;
-                for (ri, r) in regions.iter().enumerate() {
-                    if page1[i] && r.page != 1 {
-                        continue;
-                    }
-                    // The weapon section's tile belongs to the per-record
-                    // weapon texture (see `weapon_fuse`) - no sibling
-                    // islands there.
-                    if Some(r.section) == exclude_section {
-                        continue;
-                    }
-                    let (ref mut x, ref mut y, ref mut shelf) = cursors[ri];
-                    if w > r.w || h > r.h {
-                        continue;
-                    }
-                    if *x + w > r.w {
-                        *y += *shelf;
-                        *x = 0;
-                        *shelf = 0;
-                    }
-                    if *y + h > r.h {
-                        continue;
-                    }
-                    placed[i] = Some((ri, *x, *y));
-                    *x += w;
-                    *shelf = (*shelf).max(h);
-                    continue 'clusters;
-                }
-            }
-            placed
+    // vertical divisor per cluster (`Cluster::scale` is the horizontal one)
+    let mut scale_y: Vec<u32> = vec![base_scale; clusters.len()];
+    // (region, x, y) per cluster, and the ring width
+    let (placement, ring): (Vec<(usize, usize, usize)>, usize) = loop {
+        // Try with a one-texel ring round every island's polygons first (a
+        // rasteriser that overshoots a face's edge then reads the island's own
+        // colours, not a neighbour's), then without when the band is too tight.
+        let attempt = |ring: usize| -> Vec<Option<(usize, usize, usize)>> {
+            let masks: Vec<IslandMask> = clusters
+                .iter()
+                .zip(&scale_y)
+                .map(|(c, &sy)| island_mask(c, sy, ring, &covered))
+                .collect();
+            pack_masks(&regions, &masks, |i, ri| {
+                let r = &regions[ri];
+                // a `page1_only` island sits on page 1 only; the weapon
+                // section's tile belongs to the per-record weapon texture
+                // (see `weapon_fuse`) - no sibling islands there
+                !(page1[i] && r.page != 1) && Some(r.section) != exclude_section
+            })
         };
         let mut found = None;
-        for g in [1usize, 0] {
-            let placed = attempt(g);
+        for ring in [1usize, 0] {
+            let placed = attempt(ring);
             if placed.iter().all(|p| p.is_some()) {
-                found = Some((placed.into_iter().map(|p| p.unwrap()).collect(), g));
+                found = Some((placed.into_iter().map(|p| p.unwrap()).collect(), ring));
                 break;
             }
         }
@@ -456,25 +561,37 @@ pub(super) fn relayout_to_band(
             break f;
         }
         let cap = base_scale * 4;
-        let Some(big) = clusters
-            .iter_mut()
-            .filter(|c| c.scale < cap)
-            .max_by_key(|c| {
-                let w = (c.bbox.2 - c.bbox.0) as usize + 1;
-                let h = (c.bbox.3 - c.bbox.1) as usize + 1;
-                (w / c.scale as usize) * (h / c.scale as usize)
+        let Some(ci) = (0..clusters.len())
+            .filter(|&i| clusters[i].scale < cap || scale_y[i] < cap)
+            .max_by_key(|&i| {
+                let (w, h) = island_dims(clusters[i].bbox, clusters[i].scale, scale_y[i]);
+                w * h
             })
         else {
             bail!("texture islands exceed the party band tiles even at quarter resolution");
         };
-        big.scale *= 2;
+        let c = &mut clusters[ci];
+        let (w, h) = island_dims(c.bbox, c.scale, scale_y[ci]);
+        // halve the longer axis (the other when that one is at its floor)
+        if (w >= h && c.scale < cap) || scale_y[ci] >= cap {
+            c.scale *= 2;
+        } else {
+            scale_y[ci] *= 2;
+        }
         warnings.push(format!(
-            "player-side texture island {}x{} downscaled to 1/{} to fit the band",
-            big.bbox.2 - big.bbox.0 + 1,
-            big.bbox.3 - big.bbox.1 + 1,
-            big.scale
+            "player-side texture island {}x{} downscaled to 1/{} x 1/{} to fit the band",
+            c.bbox.2 - c.bbox.0 + 1,
+            c.bbox.3 - c.bbox.1 + 1,
+            c.scale,
+            scale_y[ci]
         ));
     };
+    // the band texels each island occupies (its polygons plus the ring)
+    let masks: Vec<IslandMask> = clusters
+        .iter()
+        .zip(&scale_y)
+        .map(|(c, &sy)| island_mask(c, sy, ring, &covered))
+        .collect();
 
     // Palette groups within the free-column budget.
     let mut used: Vec<u8> = faces
@@ -519,7 +636,9 @@ pub(super) fn relayout_to_band(
     };
     for (ci, c) in clusters.iter().enumerate() {
         let (ri, dx, dy) = placement[ci];
-        let s = c.scale as usize;
+        let (sx, sy) = (c.scale as isize, scale_y[ci] as isize);
+        let mask = &masks[ci];
+        let ring_i = ring as isize;
         for &fi in &c.faces {
             let f = &faces[fi];
             let p = &objects[f.obj].groups[f.group].prims[f.prim];
@@ -527,55 +646,60 @@ pub(super) fn relayout_to_band(
             let group = group_of[&(src_pal as u8)];
             let colors = &group_colors[group];
             let fb = f.bbox;
-            let (bx, by) = (c.bbox.0 as usize, c.bbox.1 as usize);
+            let (bx, by) = (c.bbox.0 as isize, c.bbox.1 as isize);
             let r = &regions[ri];
             // The band texels the face can sample: the rewritten UVs are
             // `(uv - bbox0) / s`, so it reaches `(fb0 - bbox0) / s ..=
-            // (fb2 - bbox0) / s`. At full resolution each takes the source
-            // texel under it (first writer wins). A downscaled island picks
-            // per band texel a source texel the face's polygon really
-            // covers: the box around a triangle holds the artists' padding
-            // (bright checkers), and a block-centre sample that landed in it
-            // showed up as stray coloured dots along the face's edges.
-            let tx_range = (fb.0 as usize - bx) / s..=(fb.2 as usize - bx) / s;
-            let ty_range = (fb.1 as usize - by) / s..=(fb.3 as usize - by) / s;
-            let mut picks: Vec<(usize, usize, usize, usize, bool)> = Vec::new();
+            // (fb2 - bbox0) / s`, and the ring beyond it. At full resolution
+            // each takes the source texel under it (first writer wins). A
+            // downscaled island picks per band texel a source texel the
+            // face's polygon really covers: the box around a triangle holds
+            // the artists' padding (bright checkers), and a block-centre
+            // sample that landed in it showed up as stray coloured dots along
+            // the face's edges.
+            let tx_range = (fb.0 as isize - bx) / sx - ring_i..=(fb.2 as isize - bx) / sx + ring_i;
+            let ty_range = (fb.1 as isize - by) / sy - ring_i..=(fb.3 as isize - by) / sy + ring_i;
+            let mut picks: Vec<(isize, isize, usize, usize, bool)> = Vec::new();
             for ty0 in ty_range.clone() {
                 for tx0 in tx_range.clone() {
-                    let (cx, cy) = (bx + tx0 * s + s / 2, by + ty0 * s + s / 2);
+                    let (mx, my) = (tx0 + ring_i, ty0 + ring_i);
+                    if mx < 0
+                        || my < 0
+                        || mx >= mask.w as isize
+                        || my >= mask.h as isize
+                        || !mask.cells[my as usize * mask.w + mx as usize]
+                    {
+                        continue;
+                    }
+                    let (bsx, bsy) = (bx + tx0 * sx, by + ty0 * sy);
+                    let (cx, cy) = (bsx + sx / 2, bsy + sy / 2);
                     // the covered source texel of this block nearest its centre
-                    let (x0, x1) = (
-                        (bx + tx0 * s).max(fb.0 as usize),
-                        (bx + (tx0 + 1) * s - 1).min(fb.2 as usize),
-                    );
-                    let (y0, y1) = (
-                        (by + ty0 * s).max(fb.1 as usize),
-                        (by + (ty0 + 1) * s - 1).min(fb.3 as usize),
-                    );
-                    let mut covered: Option<(usize, usize, usize)> = None;
+                    let (x0, x1) = (bsx.max(fb.0 as isize), (bsx + sx - 1).min(fb.2 as isize));
+                    let (y0, y1) = (bsy.max(fb.1 as isize), (bsy + sy - 1).min(fb.3 as isize));
+                    let mut covered_texel: Option<(isize, isize, isize)> = None;
                     for y in y0..=y1 {
                         for x in x0..=x1 {
-                            if !covers(&p.uvs, x, y) {
+                            if !covers(&p.uvs, x as usize, y as usize) {
                                 continue;
                             }
-                            let d = x.abs_diff(cx) + y.abs_diff(cy);
-                            if covered.is_none_or(|(bd, _, _)| d < bd) {
-                                covered = Some((d, x, y));
+                            let d = (x - cx).abs() + (y - cy).abs();
+                            if covered_texel.is_none_or(|(bd, _, _)| d < bd) {
+                                covered_texel = Some((d, x, y));
                             }
                         }
                     }
-                    match covered {
-                        Some((_, x, y)) => picks.push((tx0, ty0, x, y, true)),
+                    match covered_texel {
+                        Some((_, x, y)) => picks.push((tx0, ty0, x as usize, y as usize, true)),
                         None => {
-                            let x = cx.clamp(fb.0 as usize, fb.2 as usize);
-                            let y = cy.clamp(fb.1 as usize, fb.3 as usize);
+                            let x = cx.clamp(fb.0 as isize, fb.2 as isize) as usize;
+                            let y = cy.clamp(fb.1 as isize, fb.3 as isize) as usize;
                             picks.push((tx0, ty0, x, y, false));
                         }
                     }
                 }
             }
             // texels past the polygon's edge copy the nearest covered one
-            let covered_picks: Vec<(usize, usize, usize, usize)> = picks
+            let covered_picks: Vec<(isize, isize, usize, usize)> = picks
                 .iter()
                 .filter(|p| p.4)
                 .map(|p| (p.0, p.1, p.2, p.3))
@@ -583,14 +707,14 @@ pub(super) fn relayout_to_band(
             for pick in picks.iter_mut().filter(|p| !p.4) {
                 let near = covered_picks
                     .iter()
-                    .min_by_key(|h| h.0.abs_diff(pick.0).max(h.1.abs_diff(pick.1)));
+                    .min_by_key(|h| (h.0 - pick.0).abs().max((h.1 - pick.1).abs()));
                 if let Some(&(_, _, x, y)) = near {
                     pick.2 = x;
                     pick.3 = y;
                 }
             }
-            for (tx0, ty0, sx, sy, hard_pick) in picks {
-                let (tx, ty) = (dx + tx0, dy + ty0);
+            for (tx0, ty0, sx_, sy_, hard_pick) in picks {
+                let (tx, ty) = (dx + (tx0 + ring_i) as usize, dy + (ty0 + ring_i) as usize);
                 if tx >= r.w || ty >= r.h {
                     continue;
                 }
@@ -598,7 +722,7 @@ pub(super) fn relayout_to_band(
                 if painted[ri][at] && !(hard_pick && !hard[ri][at]) {
                     continue;
                 }
-                let idx = src_texel(f.page, sx, sy) as usize;
+                let idx = src_texel(f.page, sx_, sy_) as usize;
                 let color = cluts[src_pal][idx];
                 let new_idx = if (idx == 0 && !idx0_opaque) || color == 0 {
                     0
@@ -614,28 +738,11 @@ pub(super) fn relayout_to_band(
             }
         }
     }
-    // The gutter right of and below each island repeats the island's edge.
-    if gutter > 0 {
-        for (ci, c) in clusters.iter().enumerate() {
-            let (ri, dx, dy) = placement[ci];
-            let s = c.scale as usize;
-            let w = ((c.bbox.2 - c.bbox.0) as usize + 1).div_ceil(s);
-            let h = ((c.bbox.3 - c.bbox.1) as usize + 1).div_ceil(s);
-            let rw = regions[ri].w;
-            let tile = &mut tiles[ri];
-            for y in 0..h {
-                tile[(dy + y) * rw + dx + w] = tile[(dy + y) * rw + dx + w - 1];
-            }
-            for x in 0..=w {
-                tile[(dy + h) * rw + dx + x] = tile[(dy + h - 1) * rw + dx + x.min(w - 1)];
-            }
-        }
-    }
     // Rewrite the faces' UV / CBA / TSB.
     for (ci, c) in clusters.iter().enumerate() {
         let (ri, dx, dy) = placement[ci];
         let r = &regions[ri];
-        let s = c.scale as usize;
+        let (sx, sy) = (c.scale as usize, scale_y[ci] as usize);
         for &fi in &c.faces {
             let f = &faces[fi];
             let p = &mut objects[f.obj].groups[f.group].prims[f.prim];
@@ -643,8 +750,8 @@ pub(super) fn relayout_to_band(
             let group = group_of[&src_pal];
             let col = col_of_group[group];
             for uv in p.uvs.iter_mut() {
-                let nx = r.x0 + dx + (uv.0 as usize - c.bbox.0 as usize) / s;
-                let ny = r.y0 + dy + (uv.1 as usize - c.bbox.1 as usize) / s;
+                let nx = r.x0 + dx + ring + (uv.0 as usize - c.bbox.0 as usize) / sx;
+                let ny = r.y0 + dy + ring + (uv.1 as usize - c.bbox.1 as usize) / sy;
                 *uv = (nx.min(UV_SPACE - 1) as u8, ny.min(PAGE_HEIGHT - 1) as u8);
             }
             // Authoring CBA: CLUT row 480, column * 16 halfwords.
@@ -716,4 +823,77 @@ pub(super) fn relayout_to_band(
         section_pools.push(block);
     }
     Ok(BandLayout { section_pools })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn region(w: usize, h: usize) -> BandRegion {
+        BandRegion {
+            page: 0,
+            x0: 0,
+            y0: 0,
+            w,
+            h,
+            section: 0,
+        }
+    }
+
+    /// An L: a full left column and a full bottom row of a `w x h` frame.
+    fn ell(w: usize, h: usize) -> IslandMask {
+        let mut cells = vec![false; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                cells[y * w + x] = x == 0 || y == h - 1;
+            }
+        }
+        IslandMask { w, h, cells }
+    }
+
+    fn block(w: usize, h: usize) -> IslandMask {
+        IslandMask {
+            w,
+            h,
+            cells: vec![true; w * h],
+        }
+    }
+
+    #[test]
+    fn a_small_island_settles_in_the_gap_of_a_large_one() {
+        // an 8x8 L leaves a 7x7 hole; a 6x6 block cannot go beside it in an
+        // 8x8 region unless it takes the hole
+        let regions = [region(8, 8)];
+        let masks = [ell(8, 8), block(6, 6)];
+        let placed = pack_masks(&regions, &masks, |_, _| true);
+        assert_eq!(placed[0], Some((0, 0, 0)));
+        assert_eq!(placed[1], Some((0, 1, 0)));
+    }
+
+    #[test]
+    fn overlapping_islands_do_not_share_texels() {
+        let regions = [region(8, 4)];
+        let masks = [block(5, 4), block(5, 4)];
+        let placed = pack_masks(&regions, &masks, |_, _| true);
+        assert_eq!(placed.iter().filter(|p| p.is_some()).count(), 1);
+    }
+
+    #[test]
+    fn the_ring_widens_a_covered_texel() {
+        let mut c = Cluster {
+            faces: vec![0],
+            page: 0,
+            bbox: (10, 10, 12, 12),
+            scale: 1,
+            dst: (0, 0),
+        };
+        let covered = vec![vec![(11usize, 11usize)]];
+        let m = island_mask(&c, 1, 1, &covered);
+        assert_eq!((m.w, m.h), (5, 5));
+        assert_eq!(m.cells.iter().filter(|&&b| b).count(), 9);
+        c.scale = 2;
+        let m = island_mask(&c, 1, 0, &covered);
+        assert_eq!((m.w, m.h), (2, 3));
+        assert_eq!(m.cells.iter().filter(|&&b| b).count(), 1);
+    }
 }

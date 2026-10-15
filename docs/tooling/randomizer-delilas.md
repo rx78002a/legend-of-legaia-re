@@ -408,7 +408,7 @@ Mechanics (`legaia_party_swap`):
   about. The part scales axially onto the target's joint-to-joint span and
   radially by the uniform height ratio, so chains stay closed under every clip
   while the sibling's shapes survive.
-- **Texel re-layout**, bit-exact. Islands shelf-pack between the monster page
+- **Texel re-layout**, bit-exact. Islands pack by the texels their polygons cover, between the monster page
   and the party band's five section tiles. Palettes carry over, union-merged on
   the player side into the CLUT columns `record[0]` does not claim.
 - **Player file.** **Every equipment-section record** of the `PLAYERn` file is
