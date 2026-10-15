@@ -554,10 +554,11 @@ const FIREBALL_ENTRY: usize = 6;
 /// Append the boss's cast clip (tag `0x23`) to `clips` as a player art clip
 /// and return its index. The clip keeps its move-power terminator record: the
 /// terminator installs the move-power record the actor's queued move id maps
-/// to, and that record spawns the projectile. One hit event takes the
-/// terminator's frame so the art also lands a hit of its own, and the clip
-/// runs at twice the monster's cast rate.
-pub fn add_fireball_clip(clips: &mut Vec<BossClip>) -> Result<usize> {
+/// to, and that record spawns the projectile. With `own_hit` one hit event
+/// takes the terminator's frame so the art also lands a hit of its own
+/// (without it the projectile's damage is the only hit), and the clip runs at
+/// twice the monster's cast rate.
+pub fn add_fireball_clip(clips: &mut Vec<BossClip>, own_hit: bool) -> Result<usize> {
     let cast = find_tag(clips, 0x23).context("boss has no tag 0x23 cast clip")?;
     let mut play = clips[cast].clone();
     let release = (0..8)
@@ -565,7 +566,7 @@ pub fn add_fireball_clip(clips: &mut Vec<BossClip>) -> Result<usize> {
         .find(|&o| play.head[o] != 0 && play.head[o + 1] & 0x7F == 0x7F)
         .map(|o| play.head[o])
         .context("boss cast clip has no move-power terminator")?;
-    play.head[0x10..0x14].copy_from_slice(&[release, 0, 0, 0]);
+    play.head[0x10..0x14].copy_from_slice(&[if own_hit { release } else { 0 }, 0, 0, 0]);
     play.head[0x78] = play.head[0x78].max(2);
     clips.push(play);
     Ok(clips.len() - 1)

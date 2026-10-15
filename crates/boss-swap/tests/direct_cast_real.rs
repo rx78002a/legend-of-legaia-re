@@ -25,7 +25,11 @@ fn check(p: &DiscPatcher) {
     // Somersault is bank row 23: constant 0x27.
     let scus = p.read_named_file("SCUS_942.54").expect("SCUS");
     let off = |va: u32| legaia_game_tables::item_names::file_offset_for_va(&scus, va).unwrap();
-    let begin = direct_cast::assemble_begin(direct_cast::table_va(), direct_cast::UP_MELEE_BYTE);
+    let begin = direct_cast::assemble_begin(
+        direct_cast::table_va(),
+        direct_cast::UP_MELEE_BYTE,
+        Some(direct_cast::BANNER_VA),
+    );
     assert_eq!(&scus[off(SCUS_GAP_VA)..][..begin.len()], begin.as_slice());
     let table_at = off(direct_cast::table_va());
     assert_eq!(scus[table_at + 0x27 - 0x10], 1, "Somersault is a cast art");
@@ -33,6 +37,11 @@ fn check(p: &DiscPatcher) {
     let snap = direct_cast::assemble_snap();
     let snap_va = direct_cast::snap_va();
     assert_eq!(&scus[off(snap_va)..][..snap.len()], snap.as_slice());
+    let banner = direct_cast::assemble_banner(0x2A);
+    assert_eq!(
+        &scus[off(direct_cast::BANNER_VA)..][..banner.len()],
+        banner.as_slice()
+    );
     // the strike and recovery states frame the caster through the camera stub
     let camera = direct_cast::assemble_camera();
     assert_eq!(
@@ -62,7 +71,7 @@ fn hook_lands_on_the_patched_image() {
     apply(&mut p, &Options::default()).expect("apply boss swap");
     check(&p);
     assert!(
-        !direct_cast::install(&mut p, &[0x27], direct_cast::UP_MELEE_BYTE).unwrap(),
+        !direct_cast::install(&mut p, &[0x27], direct_cast::UP_MELEE_BYTE, 0x2A).unwrap(),
         "second install is a no-op"
     );
 }

@@ -83,6 +83,10 @@ pub struct Options {
     /// The fireball projectile keeps the monster spell's own damage; `false`
     /// zeroes its power so only the art's hits damage.
     pub fireball_damage: bool,
+    /// The fireball swing also lands a hit of its own at the release frame
+    /// (a second damage number before the projectile arrives); off, the
+    /// projectile's damage is the only hit.
+    pub fireball_own_hit: bool,
 }
 
 impl Default for Options {
@@ -104,6 +108,7 @@ impl Default for Options {
             mute_host_voice: true,
             calm_support: true,
             fireball_damage: true,
+            fireball_own_hit: false,
         }
     }
 }
@@ -326,7 +331,7 @@ fn apply_with(
     // melee set only.
     let mut local = opts.clone();
     if (opts.fireball_swing || opts.fireball_art.is_some())
-        && let Err(e) = boss::add_fireball_clip(&mut clips.clone())
+        && let Err(e) = boss::add_fireball_clip(&mut clips.clone(), opts.fireball_own_hit)
     {
         report.notes.push(format!(
             "no fireball: {e:#} (melee set only, no direct-cast hooks)"
@@ -348,7 +353,7 @@ fn apply_with(
         ));
     }
     let fireball = if opts.fireball_art.is_some() {
-        Some(boss::add_fireball_clip(&mut clips)?)
+        Some(boss::add_fireball_clip(&mut clips, opts.fireball_own_hit)?)
     } else {
         None
     };
@@ -370,7 +375,7 @@ fn apply_with(
     }
     let up_melee_clip = map.swings[3];
     let swing_fireball = if opts.fireball_swing {
-        let clip = boss::add_fireball_clip(&mut clips)?;
+        let clip = boss::add_fireball_clip(&mut clips, opts.fireball_own_hit)?;
         map.swings[3] = clip;
         Some(clip)
     } else {
@@ -550,7 +555,8 @@ fn apply_with(
         } else {
             direct_cast::DOWN_SWING_BYTE
         };
-        let fresh = direct_cast::install(patcher, &constants, plain_up)?;
+        let banner = fireball_spell(patcher, opts.monster)?;
+        let fresh = direct_cast::install(patcher, &constants, plain_up, banner)?;
         report.notes.push(format!(
             "direct cast hooks {}: art constants {constants:x?} collapse to the fireball swing",
             if fresh {
@@ -711,6 +717,14 @@ const SPARE_MOVE_ID: usize = 0x2C;
 /// projectile spawns, while the art's own hit events do the damage; a kill by
 /// the projectile's damage path skips the victim's reaction pose and the
 /// enemy vanishes instead of collapsing.
+/// The monster's first listed spell: the fireball's name for the banner.
+fn fireball_spell(patcher: &DiscPatcher, monster: u16) -> Result<u8> {
+    let archive = patcher.read_entry_footprint(MONSTER_ARCHIVE_ENTRY)?;
+    let block = legaia_actor_formats::monster_archive::decode_block(&archive, monster)?
+        .context("empty monster slot")?;
+    block.get(0x21).copied().context("monster record too short")
+}
+
 fn route_fireball_move(
     patcher: &mut DiscPatcher,
     monster: u16,

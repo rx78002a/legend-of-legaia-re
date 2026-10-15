@@ -43,7 +43,7 @@ use crate::module_cast::{HOOK_END_VA, HOOK_VA};
 use anyhow::{Context, Result, bail};
 use legaia_code_hooks::arenas::{ARENA1_END_VA, ARENA1_VA, SCUS_GAP_END_VA, SCUS_GAP_VA};
 use legaia_code_hooks::mips::{
-    self as m, A0, A1, RA, S1, S3, SP, T0, T1, T2, T3, T4, T5, T6, V0, ZERO,
+    self as m, A0, A1, A2, RA, S0, S1, S3, SP, T0, T1, T2, T3, T4, T5, T6, V0, V1, ZERO,
 };
 use legaia_disc_patch::disc::DiscPatcher;
 
@@ -60,6 +60,10 @@ const RANGE_FN_VA: u32 = 0x8004_E2F0;
 /// calls the strike (`0x1E`) and recovery (`0x1F`) states make with case 7 / 8
 /// (the two-shot / the target); case 6 frames the acting actor.
 const CAMERA_FN_VA: u32 = 0x801D_5854;
+/// `FUN_80035F04(name)`: a string's pixel width. `FUN_801D8DE8(element, mode)`:
+/// the HUD element opener.
+const NAME_WIDTH_FN_VA: u32 = 0x8003_5F04;
+const HUD_ELEMENT_FN_VA: u32 = 0x801D_8DE8;
 const CAMERA_SITES: [u32; 2] = [0x801E_36E8, 0x801E_3AC8];
 const CAMERA_ACTING_CASE: u16 = 6;
 const SNAP_SITE_VA: u32 = 0x8004_BFA8;
@@ -166,14 +170,14 @@ fn table(constants: &[u8]) -> [u8; TABLE_LEN] {
 }
 
 /// Assemble the attack-begin stub (SCUS gap) for a cast table at `table_va`.
-pub fn assemble_begin(table_va: u32, plain_up: u8) -> Vec<u8> {
-    begin_words(table_va, plain_up)
+pub fn assemble_begin(table_va: u32, plain_up: u8, banner: Option<u32>) -> Vec<u8> {
+    begin_words(table_va, plain_up, banner)
         .iter()
         .flat_map(|x| x.to_le_bytes())
         .collect()
 }
 
-fn begin_words(table_va: u32, plain_up: u8) -> Vec<u32> {
+fn begin_words(table_va: u32, plain_up: u8, banner: Option<u32>) -> Vec<u32> {
     let mut a = Asm::new();
     let (ret, scan, next, found, starter, chk) = (
         a.label(),
@@ -239,6 +243,11 @@ fn begin_words(table_va: u32, plain_up: u8) -> Vec<u32> {
     a.op(m::sb(T5, S3, 0x1DF)); // t5 = FIREBALL_BYTE
     a.op(m::sb(ZERO, S3, 0x1E0));
     a.op(m::addu(V0, ZERO, ZERO)); // in range
+    if let Some(va) = banner {
+        // tail-jump: `ra` is the caller's, the banner routine returns v0 = 0
+        a.op(m::j(va));
+        a.op(m::nop());
+    }
     a.bind(ret);
     a.op(m::jr(RA));
     a.op(m::nop());
@@ -278,6 +287,53 @@ pub fn assemble_snap() -> Vec<u8> {
     a.finish().iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
+/// Raise the spell-name banner (`Hyper Wave`) for a cast of `spell`, the way a
+/// monster caster's cast begin (state `0x28`) does: the name pointer out of the
+/// spell table (`0x800754C8 + spell * 12 + 8`), centred on the screen by its
+/// width (`FUN_80035F04`) into the four descriptor slots, then HUD element
+/// `0x4C` (`FUN_801D8DE8`). A party caster's cast begin skips that block, and
+/// the fireball is a swing, so the banner never came up. Entered by a tail
+/// jump from the begin stub; returns `v0 = 0` (in range) to its caller.
+pub fn assemble_banner(spell: u8) -> Vec<u8> {
+    let mut a = Asm::new();
+    a.op(m::addiu(SP, SP, 0xFFE0));
+    a.op(m::sw(RA, SP, 0x1C));
+    a.op(m::sw(S0, SP, 0x18));
+    a.op(m::lui(S0, 0x8007));
+    a.op(m::addiu(S0, S0, 0x54C8)); // spell table
+    a.op(m::addiu(V1, ZERO, u16::from(spell)));
+    a.op(m::sll(V0, V1, 1));
+    a.op(m::addu(V0, V0, V1));
+    a.op(m::sll(V0, V0, 2)); // * 12
+    a.op(m::addu(S0, S0, V0)); // this spell's record
+    a.op(m::lw(A0, S0, 8)); // name pointer
+    a.op(m::jal(NAME_WIDTH_FN_VA));
+    a.op(m::nop());
+    a.op(m::sra(V0, V0, 1));
+    a.op(m::addiu(V1, ZERO, 0xA0));
+    a.op(m::subu(V1, V1, V0)); // centred x
+    a.op(m::lui(A2, 0x8007));
+    a.op(m::addiu(A2, A2, 0x6C10));
+    for off in [0x742u16, 0x73A, 0x72A, 0x722] {
+        a.op(m::sh(V1, A2, off));
+    }
+    a.op(m::lw(V0, S0, 8));
+    a.op(m::addiu(A0, ZERO, 0x4C));
+    a.op(m::addu(A1, ZERO, ZERO));
+    a.op(m::sw(V0, A2, 0x74C));
+    a.op(m::jal(HUD_ELEMENT_FN_VA));
+    a.op(m::sw(V0, A2, 0x734)); // delay slot, as the retail block
+    a.op(m::lw(RA, SP, 0x1C));
+    a.op(m::lw(S0, SP, 0x18));
+    a.op(m::addu(V0, ZERO, ZERO));
+    a.op(m::jr(RA));
+    a.op(m::addiu(SP, SP, 0x20));
+    a.finish().iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+/// Where the banner routine sits in the rodata gap, behind the camera stub.
+pub const BANNER_VA: u32 = HOOK_VA + 0x60;
+
 /// The camera stub behind the strike and recovery states' framing calls
 /// (`a0` = seat, `a1` = the case): for the collapsed fireball swing (seat 0,
 /// queue exactly `[0x0F, 0]`) it asks for the acting-actor framing, so the
@@ -312,11 +368,16 @@ fn bne_t3z(o: i16) -> u32 {
 
 /// Write the stubs and redirect the two range calls. Returns `false` when
 /// everything is already in place.
-pub fn install(patcher: &mut DiscPatcher, constants: &[u8], plain_up: u8) -> Result<bool> {
+pub fn install(
+    patcher: &mut DiscPatcher,
+    constants: &[u8],
+    plain_up: u8,
+    banner_spell: u8,
+) -> Result<bool> {
     if constants.is_empty() {
         bail!("direct cast needs at least one cast art");
     }
-    let begin = assemble_begin(table_va(), plain_up);
+    let begin = assemble_begin(table_va(), plain_up, Some(BANNER_VA));
     if SCUS_GAP_VA + begin.len() as u32 > SCUS_GAP_END_VA {
         bail!("direct-cast stub does not fit the SCUS gap");
     }
@@ -335,6 +396,11 @@ pub fn install(patcher: &mut DiscPatcher, constants: &[u8], plain_up: u8) -> Res
         bail!("direct-cast camera stub does not fit its gap");
     }
     changed |= write_scus(patcher, HOOK_VA, &camera)?;
+    let banner = assemble_banner(banner_spell);
+    if BANNER_VA + banner.len() as u32 > HOOK_END_VA || camera.len() as u32 > BANNER_VA - HOOK_VA {
+        bail!("direct-cast banner routine does not fit its gap");
+    }
+    changed |= write_scus(patcher, BANNER_VA, &banner)?;
 
     let entry = patcher.read_entry(BATTLE_OVERLAY_PROT)?;
     let at = (RANGE_CALL_VA - BATTLE_OVERLAY_BASE) as usize;
@@ -413,8 +479,23 @@ mod tests {
 
     fn begin(seat: u32, queue: &[u8], range: u32) -> (u32, Vec<u8>) {
         let mut cpu = Cpu::new();
-        cpu.load(SCUS_GAP_VA, &assemble_begin(table_va(), UP_MELEE_BYTE));
+        cpu.load(
+            SCUS_GAP_VA,
+            &assemble_begin(table_va(), UP_MELEE_BYTE, Some(BANNER_VA)),
+        );
         cpu.load(table_va(), &table(&CASTS));
+        // stand-in for the banner routine: flags the call, returns in range
+        cpu.load_words(
+            BANNER_VA,
+            &[
+                m::lui(T0, 0x8010),
+                m::addiu(T1, ZERO, 1),
+                m::sb(T1, T0, 0x1000),
+                m::addu(V0, ZERO, ZERO),
+                m::jr(RA),
+                m::nop(),
+            ],
+        );
         cpu.load_words(
             RANGE_FN_VA,
             &[m::addiu(V0, ZERO, range as u16), m::jr(RA), m::nop()],
@@ -434,8 +515,8 @@ mod tests {
     #[test]
     fn no_stub_reads_a_register_in_its_load_delay() {
         for b in [
-            assemble_begin(table_va(), UP_MELEE_BYTE),
-            assemble_begin(table_va(), 0x0E),
+            assemble_begin(table_va(), UP_MELEE_BYTE, Some(BANNER_VA)),
+            assemble_begin(table_va(), 0x0E, Some(BANNER_VA)),
             assemble_snap(),
         ] {
             let w: Vec<u32> = b
@@ -458,6 +539,50 @@ mod tests {
             assert_eq!(v0, 0, "{queue:x?}");
             assert_eq!(&q[..2], &[FIREBALL_BYTE, 0], "{queue:x?}");
         }
+    }
+
+    #[test]
+    fn the_banner_comes_up_once_for_a_cast_art_and_never_otherwise() {
+        let fired = |seat: u32, queue: &[u8]| {
+            let mut cpu = Cpu::new();
+            cpu.load(
+                SCUS_GAP_VA,
+                &assemble_begin(table_va(), UP_MELEE_BYTE, Some(BANNER_VA)),
+            );
+            cpu.load(table_va(), &table(&CASTS));
+            cpu.load_words(
+                BANNER_VA,
+                &[
+                    m::lui(T0, 0x8010),
+                    m::addiu(T1, ZERO, 1),
+                    m::sb(T1, T0, 0x1000),
+                    m::addu(V0, ZERO, ZERO),
+                    m::jr(RA),
+                    m::nop(),
+                ],
+            );
+            cpu.load_words(RANGE_FN_VA, &[m::addiu(V0, ZERO, 900), m::jr(RA), m::nop()]);
+            cpu.load(ACTOR + 0x1DF, queue);
+            cpu.r[S3 as usize] = ACTOR;
+            cpu.r[A0 as usize] = seat;
+            cpu.r[SP as usize] = STACK;
+            cpu.r[RA as usize] = RETURN_VA;
+            cpu.pc = SCUS_GAP_VA;
+            cpu.run_until(&[RETURN_VA]);
+            (cpu.rd8(0x8010_1000) == 1, cpu.r[V0 as usize])
+        };
+        assert_eq!(fired(0, &[0x0F, 0x0E, 0x19, 0x27, 0]), (true, 0));
+        assert_eq!(fired(0, &[0x0F, 0x0C, 0]), (false, 900), "a plain Up");
+        assert_eq!(
+            fired(1, &[0x0F, 0x19, 0x27, 0]),
+            (false, 900),
+            "not the host"
+        );
+        assert_eq!(
+            fired(0, &[0x19, 0x31, 0x0D, 0]),
+            (false, 900),
+            "not a cast art"
+        );
     }
 
     #[test]
@@ -543,6 +668,51 @@ mod tests {
     }
 
     #[test]
+    fn the_banner_names_the_spell_and_returns_in_range() {
+        let mut cpu = Cpu::new();
+        cpu.load(BANNER_VA, &assemble_banner(0x2A));
+        // the spell table row 0x2A: name pointer at +8
+        let row = 0x8007_54C8 + 0x2A * 12;
+        cpu.wr32(row + 8, 0x8009_1234);
+        // FUN_80035F04: width 40; FUN_801D8DE8: records its element and mode
+        cpu.load_words(
+            NAME_WIDTH_FN_VA,
+            &[m::addiu(V0, ZERO, 40), m::jr(RA), m::nop()],
+        );
+        cpu.load_words(
+            HUD_ELEMENT_FN_VA,
+            &[
+                m::lui(T0, 0x8010),
+                m::sw(A0, T0, 0),
+                m::sw(A1, T0, 4),
+                m::jr(RA),
+                m::nop(),
+            ],
+        );
+        cpu.r[S0 as usize] = 0xCAFE;
+        cpu.r[SP as usize] = STACK;
+        cpu.r[RA as usize] = RETURN_VA;
+        cpu.pc = BANNER_VA;
+        cpu.run_until(&[RETURN_VA]);
+        assert_eq!(cpu.r[V0 as usize], 0, "in range");
+        assert_eq!(cpu.r[SP as usize], STACK, "stack balanced");
+        assert_eq!(cpu.r[S0 as usize], 0xCAFE, "s0 preserved");
+        assert_eq!((cpu.rd32(0x8010_0000), cpu.rd32(0x8010_0004)), (0x4C, 0));
+        // centred on x = 160: 160 - 40 / 2 = 140 in the four slots
+        for off in [0x742u32, 0x73A, 0x72A, 0x722] {
+            assert_eq!(cpu.rd32(0x8007_6C10 + off) & 0xFFFF, 140, "{off:#x}");
+        }
+        assert_eq!(cpu.rd32(0x8007_6C10 + 0x734), 0x8009_1234);
+        assert_eq!(cpu.rd32(0x8007_6C10 + 0x74C), 0x8009_1234);
+        let w: Vec<u32> = assemble_banner(0x2A)
+            .chunks(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert!(crate::hazard::load_hazards(&w).is_empty());
+        assert!(BANNER_VA as usize + w.len() * 4 <= HOOK_END_VA as usize);
+    }
+
+    #[test]
     fn camera_stub_has_no_load_hazard_and_fits() {
         let b = assemble_camera();
         let w: Vec<u32> = b
@@ -555,7 +725,7 @@ mod tests {
 
     #[test]
     fn stubs_fit_their_arenas() {
-        let image = assemble_begin(table_va(), UP_MELEE_BYTE);
+        let image = assemble_begin(table_va(), UP_MELEE_BYTE, Some(BANNER_VA));
         assert!(SCUS_GAP_VA as usize + image.len() <= SCUS_GAP_END_VA as usize);
         assert!(table_va() as usize + TABLE_LEN <= ARENA1_END_VA as usize);
     }
@@ -573,7 +743,11 @@ mod dump {
         let dir = std::path::PathBuf::from(dir);
         std::fs::write(
             dir.join("begin.bin"),
-            super::assemble_begin(super::table_va(), super::UP_MELEE_BYTE),
+            super::assemble_begin(
+                super::table_va(),
+                super::UP_MELEE_BYTE,
+                Some(super::BANNER_VA),
+            ),
         )
         .unwrap();
         std::fs::write(dir.join("snap.bin"), super::assemble_snap()).unwrap();
